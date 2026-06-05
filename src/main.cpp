@@ -343,11 +343,10 @@ static void render() {
   u8g2->drawStr(262, 58, act1.c_str());
   u8g2->drawStr(262, 78, act2.c_str());
 
-  // IP + pairing state, small, just above the divider
+  // IP, small, just above the divider
   if (WiFi.status() == WL_CONNECTED) {
     u8g2->setFont(u8g2_font_5x7_tf);
     String ip = "ip " + WiFi.localIP().toString();
-    if (g_token.length() == 0) ip += "  PAIR ME via ./install.sh in /claude-to-RLCD";
     u8g2->drawStr(120, 96, ip.c_str());
   }
 
@@ -355,6 +354,15 @@ static void render() {
   u8g2->drawHLine(20, 102, 360);
 
   renderGrid();
+
+  // Pair hint as a subtitle under the big status word, while unpaired.
+  if (g_token.length() == 0) {
+    u8g2->setFont(u8g2_font_6x13_tf);
+    const char* hint = "PAIR ME via ./install.sh in /claude-to-RLCD";
+    int hw = u8g2->getStrWidth(hint);
+    u8g2->drawStr((LCD_W - hw) / 2, 218, hint);
+  }
+
   renderBottomStrip();
 
   u8g2->sendBuffer();
