@@ -22,6 +22,7 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <time.h>
 #include <esp_rom_sys.h>
 #include "ST7305_U8g2.h"
 
@@ -37,6 +38,7 @@ static String      g_token = "";   // empty = open mode (legacy / awaiting pairi
 #define RLCD_DC_PIN     5
 #define RLCD_CS_PIN    40
 #define RLCD_RST_PIN   41
+#define KEY_PIN        18   // on-board KEY button, active-low (per Waveshare pin table)
 
 #define LCD_W 400
 #define LCD_H 300
@@ -65,6 +67,87 @@ static uint32_t g_count      = 0;
 static String   g_sessionPct = "--";
 static String   g_resetAt    = "--:--";
 static String   g_weeklyUsd  = "--";
+
+// ---- Daily quote pool --------------------------------------------------------
+// Drawn from once per UTC day (index = days_since_epoch % NQ). Each quote line
+// + author + the "A gift from Diwen Si" inscription occupy a 60-px strip below
+// the source-cell grid. Mixed English (Nobel lecture / Hao Wang) and simplified
+// Chinese (classical + modern Chinese intellectuals). All verified against
+// primary sources — see obsidian/ESP32_RLCD/Development_log.md if updating.
+struct Quote { const char* text; const char* author; bool chinese; };
+static const Quote QUOTES[] = {
+  // English (11)
+  {"Economists are drawn to areas with simple, elegant, and uncontroversial models.", "O. Hart",      false},
+  {"The logic of this model is refreshingly simple.",                                  "B. Holmstrom", false},
+  {"There is no one right way about theorizing.",                                      "B. Holmstrom", false},
+  {"Truth is not a Nash equilibrium.",                                                 "L. Hurwicz",   false},
+  {"In mechanism design theory the direction of inquiry is reversed.",                 "E. Maskin",    false},
+  {"Questions about fundamental social reforms require fundamental social theory.",    "R. Myerson",   false},
+  {"Why do economists rely on such unrealistic assumptions?",                          "P. Milgrom",   false},
+  {"It builds models that capture the essence of the situation.",                      "J. Tirole",    false},
+  {"As any researcher, we know that our ideas can be used or abused -- or ignored.",   "J. Stiglitz",  false},
+  {"The task is as intellectually exciting as it is difficult.",                       "G. Akerlof",   false},
+  {"Zest for both system and objectivity is the formal logician's original sin.",      "H. Wang",      false},
+  // Chinese (9, simplified)
+  {"独立之精神，自由之思想。",                     "陈寅恪", true},
+  {"不以物喜，不以己悲。",                         "范仲淹", true},
+  {"回首向来萧瑟处，归去，也无风雨也无晴。",       "苏轼",   true},
+  {"必神游冥想，与立说之古人，处于同一境界。",     "陈寅恪", true},
+  {"衣带渐宽终不悔，为伊消得人憔悴。",             "柳永",   true},
+  {"古人之所未及就，后世之所不可无，而后为之。",   "顾炎武", true},
+  {"东海西海，心理攸同；南学北学，道术未裂。",     "钱钟书", true},
+  {"史所贵者义也，而所具者事也，所凭者文也。",     "章学诚", true},
+  {"捉住了这个主要矛盾，一切问题就迎刃而解了。",   "毛泽东", true},
+};
+static const int NQ = sizeof(QUOTES) / sizeof(QUOTES[0]);
+
+// Calendar order: shuffled so that consecutive days alternate between the
+// English (Nobel/Wang) and Chinese (classical + modern) pools. Two English
+// quotes land back-to-back exactly once per 20-day cycle (positions 18-19
+// across the wrap, since English outnumbers Chinese 11 to 9). Edit this
+// table — not the QUOTES[] order above — if you want a different sequence.
+static const uint8_t QUOTE_ORDER[] = {
+   0,  // Hart                  (E)
+  11,  // 陈寅恪 独立之精神      (C)
+   1,  // Holmstrom logic       (E)
+  12,  // 范仲淹  不以物喜       (C)
+   3,  // Hurwicz               (E)
+  13,  // 苏轼    回首向来       (C)
+   4,  // Maskin                (E)
+  14,  // 陈寅恪 神游冥想        (C)
+   5,  // Myerson               (E)
+  15,  // 柳永    衣带渐宽       (C)
+   6,  // Milgrom               (E)
+  16,  // 顾炎武 古人之所未及    (C)
+   2,  // Holmstrom no one way  (E)
+  17,  // 钱钟书 东海西海        (C)
+   7,  // Tirole                (E)
+  18,  // 章学诚 史所贵者        (C)
+   9,  // Akerlof               (E)
+  19,  // 毛泽东 主要矛盾        (C)
+   8,  // Stiglitz              (E)
+  10,  // Hao Wang              (E)
+};
+static_assert(sizeof(QUOTE_ORDER) == NQ, "QUOTE_ORDER must match QUOTES length");
+
+// Returns the quote index for today, or -1 if NTP hasn't synced yet.
+// `/quote-tour` overrides the slot transiently to cycle every quote for QA.
+static int      g_quoteOverride   = -1;
+static int      g_quoteTourIdx    = -1;       // -1 = not touring
+static uint32_t g_quoteTourStart  = 0;
+static const uint32_t QUOTE_TOUR_MS = 5000;   // 5s per quote
+
+static int dailyQuoteIndex() {
+  int slot;
+  if (g_quoteOverride >= 0 && g_quoteOverride < NQ) {
+    slot = g_quoteOverride;
+  } else {
+    time_t t = time(nullptr);
+    if (t < 1700000000) return -1;   // not synced (Unix time before 2023-11)
+    slot = (int)((t / 86400) % NQ);
+  }
+  return QUOTE_ORDER[slot];
+}
 
 static int findOrAddSource(const String& id) {
   for (int i = 0; i < g_nsrc; i++) if (g_src[i].id == id) { g_src[i].lastMs = millis(); return i; }
@@ -102,8 +185,8 @@ static void drawClaudeBurst(int cx, int cy, int rLong) {
 
 // Pick a status font that fits a given cell width × height.
 static const uint8_t* pickStatusFont(int w, int h) {
-  if (w >= 380 && h >= 120) return u8g2_font_osb41_tr;  // single cell
-  if (h >= 120) return u8g2_font_osb29_tr;              // 2 cells (full height)
+  if (w >= 380 && h >= 150) return u8g2_font_osb41_tr;  // single cell
+  if (h >= 150) return u8g2_font_osb29_tr;              // 2 cells (full height)
   return u8g2_font_osb21_tr;                            // 2x2 or short cells
 }
 
@@ -136,25 +219,94 @@ static void renderCell(int x, int y, int w, int h, const Source& s) {
   }
 }
 
-// Middle region: y = 95 .. 235 (140 px tall). Grid is up to 2 cols × 2 rows.
+// Cell region: y = 102 .. 234 (132 px tall). Bottom strip (235..295) holds
+// the daily quote + inscription.
 static void renderGrid() {
+  const int Y0 = 102, H = 235 - Y0;   // 133 px tall
   if (g_nsrc == 0) {
     Source placeholder = {"", "READY", "", 0};
-    renderCell(0, 95, LCD_W, 140, placeholder);
+    renderCell(0, Y0, LCD_W, H, placeholder);
     return;
   }
   if (g_nsrc == 1) {
-    renderCell(0, 95, LCD_W, 140, g_src[0]);
+    renderCell(0, Y0, LCD_W, H, g_src[0]);
     return;
   }
-  int rows = (g_nsrc + 1) / 2;   // 2 → 1 row, 3..4 → 2 rows
+  int rows = (g_nsrc + 1) / 2;
   int cellW = LCD_W / 2;
-  int cellH = 140 / rows;
+  int cellH = H / rows;
   for (int i = 0; i < g_nsrc; i++) {
     int row = i / 2;
     int col = i % 2;
-    renderCell(col * cellW, 95 + row * cellH, cellW, cellH, g_src[i]);
+    renderCell(col * cellW, Y0 + row * cellH, cellW, cellH, g_src[i]);
   }
+}
+
+// Bottom strip: daily quote, author attribution, and the gift inscription.
+// Layout (y = 235..295):
+//   y=235      top divider
+//   ~y=255     quote — one line, or two lines for long English (>65 chars)
+//   y=283      attribution (left)  +  inscription (right)
+// Chinese quotes: WQY 12px GB2312 (covers hanzi + em-dash). English short
+// (≤50): helvR10. English medium (51-65): helvR08, single line. English
+// long (>65): helvR08 wrapped to two lines at the nearest space to midpoint.
+static void renderBottomStrip() {
+  u8g2->drawHLine(20, 235, 360);
+
+  static const char* INSCRIPTION = "A gift from Diwen Si";
+
+  int idx = dailyQuoteIndex();
+  if (idx < 0) {
+    u8g2->setFont(u8g2_font_helvR08_tr);
+    int w = u8g2->getStrWidth(INSCRIPTION);
+    u8g2->drawStr((LCD_W - w) / 2, 270, INSCRIPTION);
+    return;
+  }
+
+  const Quote& q = QUOTES[idx];
+
+  // ---- Quote line(s) -----------------------------------------------------
+  if (q.chinese) {
+    u8g2->setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2->drawUTF8(20, 260, q.text);
+  } else {
+    int len = strlen(q.text);
+    if (len <= 65) {
+      u8g2->setFont(len <= 50 ? u8g2_font_helvR10_tr : u8g2_font_helvR08_tr);
+      u8g2->drawStr(20, 260, q.text);
+    } else {
+      // Wrap at the space closest to the midpoint.
+      int mid = len / 2;
+      int brk = mid;
+      while (brk > 0 && q.text[brk] != ' ') brk--;
+      if (brk == 0) brk = mid;
+      char line1[120];
+      int n = brk < 119 ? brk : 119;
+      memcpy(line1, q.text, n);
+      line1[n] = '\0';
+      const char* line2 = q.text + brk + 1;
+      u8g2->setFont(u8g2_font_helvR08_tr);
+      u8g2->drawStr(20, 252, line1);
+      u8g2->drawStr(20, 266, line2);
+    }
+  }
+
+  // ---- Attribution (left) + Inscription (right) -------------------------
+  // For Chinese authors the WQY font is required to render the hanzi (and
+  // the em-dash, which is outside Latin-1). English-author attributions use
+  // a compact "-- Name" in helvR08 for visual balance with the quote.
+  if (q.chinese) {
+    u8g2->setFont(u8g2_font_wqy12_t_gb2312);
+    String att = String("— ") + q.author;
+    u8g2->drawUTF8(20, 286, att.c_str());
+  } else {
+    u8g2->setFont(u8g2_font_helvR08_tr);
+    String att = String("-- ") + q.author;
+    u8g2->drawStr(20, 286, att.c_str());
+  }
+  u8g2->setFont(u8g2_font_helvR08_tr);
+  int iw = u8g2->getStrWidth(INSCRIPTION);
+  u8g2->drawStr(LCD_W - iw - 20, 286, INSCRIPTION);
 }
 
 static void render() {
@@ -166,36 +318,39 @@ static void render() {
   // Top-left: Claude burst
   drawClaudeBurst(55, 55, 38);
 
-  // Top-right: title + usage stats
+  // Top-right: title, then two side-by-side blocks (usage | activity)
   u8g2->setFont(u8g2_font_helvB12_tr);
-  u8g2->drawStr(120, 35, "Claude Code");
+  u8g2->drawStr(120, 32, "Claude Code");
+
+  // Usage block (left half of the top-right strip)
   u8g2->setFont(u8g2_font_6x13_tf);
   String l1 = "5h " + g_sessionPct + "%   reset " + g_resetAt;
   String l2 = "week $" + g_weeklyUsd;
   u8g2->drawStr(120, 58, l1.c_str());
   u8g2->drawStr(120, 78, l2.c_str());
 
+  // Vertical separator between the two blocks
+  u8g2->drawVLine(252, 44, 50);
+
+  // Activity block (right half) — last update + response count
+  String act1 = "last " + g_lastStamp;
+  String act2 = "resp " + String(g_count);
+  u8g2->drawStr(262, 58, act1.c_str());
+  u8g2->drawStr(262, 78, act2.c_str());
+
   // IP + pairing state, small, just above the divider
   if (WiFi.status() == WL_CONNECTED) {
     u8g2->setFont(u8g2_font_5x7_tf);
     String ip = "ip " + WiFi.localIP().toString();
     if (g_token.length() == 0) ip += "  PAIR ME";
-    u8g2->drawStr(120, 92, ip.c_str());
+    u8g2->drawStr(120, 96, ip.c_str());
   }
 
-  // Dividers
-  u8g2->drawHLine(20, 95, 360);
-  u8g2->drawHLine(20, 235, 360);
+  // Single divider — cells extend all the way to the bottom edge.
+  u8g2->drawHLine(20, 102, 360);
 
-  // Grid of source cells in the middle region
   renderGrid();
-
-  // Footer
-  u8g2->setFont(u8g2_font_6x13_tf);
-  String foot1 = "Last update: " + g_lastStamp;
-  String foot2 = "Responses: " + String(g_count);
-  u8g2->drawStr(25, 260, foot1.c_str());
-  u8g2->drawStr(25, 285, foot2.c_str());
+  renderBottomStrip();
 
   u8g2->sendBuffer();
 }
@@ -314,8 +469,109 @@ static void handleNotify() {
   server.send(200, "text/plain", "ok\n");
 }
 
+// ---- KEY button handler -----------------------------------------------------
+// Press tiers (no laptop / no network needed):
+//   tap (<1s):  flash pairing token on the LCD for 5s
+//   hold 5s:   clear all source cells (= /forget?all=1)
+//   hold 15s:  factory reset — wipe WiFi creds + token, reboot into portal
+// Holding past 1s shows an on-screen prompt with a progress bar so the user
+// can release in time. Releasing at 1-5s aborts.
+static int      g_keyState        = HIGH;
+static uint32_t g_keyDownMs       = 0;
+static uint32_t g_keyLastChangeMs = 0;
+static uint32_t g_keyLastHintMs   = 0;
+static int      g_keyTier         = 0;   // 0=armed-nothing, 1=clear-armed, 2=reset-armed
+
+static void renderKeyHint(uint32_t heldMs) {
+  u8g2->clearBuffer();
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawBox(0, 0, LCD_W, LCD_H);
+  u8g2->setDrawColor(FG_COLOR);
+  u8g2->setFont(u8g2_font_helvB14_tr);
+  if (heldMs < 5000) {
+    u8g2->drawStr(40, 60, "Holding KEY...");
+    u8g2->setFont(u8g2_font_6x13_tf);
+    u8g2->drawStr(40, 110, "Release now: nothing happens");
+    u8g2->drawStr(40, 135, "Hold 5s: clear all source cells");
+    u8g2->drawStr(40, 160, "Hold 15s: factory reset");
+    int barW = (int)((uint64_t)heldMs * (LCD_W - 80) / 5000);
+    u8g2->drawFrame(40, 220, LCD_W - 80, 16);
+    u8g2->drawBox(40, 220, barW, 16);
+    u8g2->setFont(u8g2_font_5x7_tf);
+    u8g2->drawStr(40, 250, "next: clear cells (5s)");
+  } else {
+    u8g2->drawStr(40, 60, "Clear-cells armed");
+    u8g2->setFont(u8g2_font_6x13_tf);
+    u8g2->drawStr(40, 110, "Release now: clears all source cells");
+    u8g2->drawStr(40, 135, "Hold 15s total: FACTORY RESET");
+    u8g2->drawStr(40, 160, "(wipes WiFi + pairing token)");
+    int barW = (int)((uint64_t)(heldMs - 5000) * (LCD_W - 80) / 10000);
+    u8g2->drawFrame(40, 220, LCD_W - 80, 16);
+    u8g2->drawBox(40, 220, barW, 16);
+    u8g2->setFont(u8g2_font_5x7_tf);
+    u8g2->drawStr(40, 250, "next: factory reset (15s)");
+  }
+  u8g2->sendBuffer();
+}
+
+static void handleKey() {
+  int v = digitalRead(KEY_PIN);
+  uint32_t now = millis();
+
+  if (v != g_keyState && (now - g_keyLastChangeMs > 30)) {
+    g_keyState        = v;
+    g_keyLastChangeMs = now;
+    if (v == LOW) {
+      g_keyDownMs     = now;
+      g_keyLastHintMs = 0;
+      g_keyTier       = 0;
+    } else {
+      uint32_t held = now - g_keyDownMs;
+      g_keyDownMs = 0;
+      if (held < 1000) {
+        if (g_token.length()) { renderTokenBanner(g_token); delay(5000); }
+      } else if (g_keyTier == 1) {
+        g_nsrc = 0;
+        esp_rom_printf("[key] cleared all source cells\n");
+      }
+      g_keyTier = 0;
+      render();
+    }
+  }
+
+  if (g_keyDownMs && (now - g_keyDownMs) > 1000) {
+    uint32_t held = now - g_keyDownMs;
+    if (now - g_keyLastHintMs > 500) {
+      renderKeyHint(held);
+      g_keyLastHintMs = now;
+    }
+    if (held >= 5000  && g_keyTier < 1) g_keyTier = 1;
+    if (held >= 15000 && g_keyTier < 2) {
+      g_keyTier = 2;
+      esp_rom_printf("[key] FACTORY RESET\n");
+      g_prefs.clear();
+      g_token = "";
+      WiFiManager wm2;
+      wm2.resetSettings();
+      u8g2->clearBuffer();
+      u8g2->setDrawColor(BG_COLOR);
+      u8g2->drawBox(0, 0, LCD_W, LCD_H);
+      u8g2->setDrawColor(FG_COLOR);
+      u8g2->setFont(u8g2_font_helvB14_tr);
+      u8g2->drawStr(80, 150, "FACTORY RESET");
+      u8g2->setFont(u8g2_font_6x13_tf);
+      u8g2->drawStr(80, 180, "rebooting...");
+      u8g2->sendBuffer();
+      delay(2000);
+      ESP.restart();
+    }
+  }
+}
+
 void setup() {
   esp_rom_printf("[boot] Claude RLCD notifier\n");
+
+  pinMode(KEY_PIN, INPUT_PULLUP);
 
   g_prefs.begin("claude-rlcd", false);
   g_token = g_prefs.getString("token", "");
@@ -352,6 +608,10 @@ void setup() {
   } else {
     esp_rom_printf("[mdns] begin failed\n");
   }
+
+  // NTP — UTC only; used solely to index the daily quote pool by
+  // days-since-epoch. Display timestamps still come from the driving machine.
+  configTzTime("UTC0", "pool.ntp.org", "time.google.com");
 
   server.on("/",       handleRoot);
   server.on("/notify", handleNotify);
@@ -415,6 +675,20 @@ void setup() {
     ESP.restart();
   });
 
+  // Cycle through every quote in the pool, 5s each. Non-blocking — the loop
+  // advances the index from millis(). Useful for visual QA after editing the
+  // pool. No auth required: read-only effect that auto-clears.
+  server.on("/quote-tour", []() {
+    g_quoteTourIdx   = 0;
+    g_quoteTourStart = millis();
+    g_quoteOverride  = 0;
+    render();
+    String s = "quote tour started — " + String(NQ) + " quotes, " +
+               String(QUOTE_TOUR_MS / 1000) + "s each (~" +
+               String((NQ * QUOTE_TOUR_MS) / 1000) + "s total)\n";
+    server.send(200, "text/plain", s.c_str());
+  });
+
   server.on("/forget", []() {
     if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
     if (server.hasArg("all")) { g_nsrc = 0; }
@@ -439,5 +713,30 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  handleKey();
+
+  // Advance the quote tour, if one is running.
+  if (g_quoteTourIdx >= 0) {
+    int newIdx = (millis() - g_quoteTourStart) / QUOTE_TOUR_MS;
+    if (newIdx >= NQ) {
+      g_quoteTourIdx  = -1;
+      g_quoteOverride = -1;
+      render();
+    } else if (newIdx != g_quoteTourIdx) {
+      g_quoteTourIdx  = newIdx;
+      g_quoteOverride = newIdx;
+      render();
+    }
+  }
+
+  // Re-render once when the UTC day rolls over so the daily quote updates
+  // even if no hook fires that day.
+  static int s_lastDay = -2;
+  int d = dailyQuoteIndex();
+  if (d != s_lastDay && g_quoteTourIdx < 0) {
+    s_lastDay = d;
+    render();
+  }
+
   delay(2);
 }

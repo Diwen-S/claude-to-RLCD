@@ -37,7 +37,7 @@ That's it. The rest of this README is reference and troubleshooting.
 ## Hardware
 
 - **Board:** Waveshare ESP32-S3-RLCD-4.2 (400×300 monochrome reflective LCD, ST7305 controller).
-- **GPIOs used:** SCK=11, MOSI=12, DC=5, CS=40, RST=41 (per Waveshare's official examples).
+- **GPIOs used:** SCK=11, MOSI=12, DC=5, CS=40, RST=41 (LCD), GPIO18 (KEY button, active-low, internal pull-up).
 - **USB:** the single USB-C is both UART (via CH343) and the upload port.
 
 ## What's in this folder
@@ -92,14 +92,30 @@ curl "http://claude-rlcd.local/forget?t=$T&src=Foo%20(Code)"
 curl "http://claude-rlcd.local/forget?t=$T&all=1"
 ```
 
+## Physical KEY button
+
+The on-board KEY button (GPIO18) is the no-laptop, no-network recovery path:
+
+| Gesture | Action |
+|---|---|
+| Tap (<1s) | Flash pairing token on the LCD for 5s. Equivalent to `curl /show-token`. |
+| Hold 5s, release | Clear all source cells. Equivalent to `curl /forget?all=1`. |
+| Hold **15s** | Factory reset — wipes WiFi creds AND pairing token, reboots into the captive portal. |
+
+While held past 1 second, the LCD shows a progress bar and the next-tier
+action so you can release in time. Releasing between 1-5s aborts.
+
 ## What the screen shows
 
 - Top-left: Claude burst logo.
 - Top-right: `Claude Code` title + `5h XX%   reset HH:MM` + `week $XX` +
-  device IP. If the device is unpaired, the IP line also shows `PAIR ME` —
-  run `install.sh` (or call `/pair?token=…` directly) to set a token.
-- Middle: grid of source cells (1 = full, 2 = side-by-side, 3 = 2-on-top + 1, 4 = 2×2). Each cell has a small label and a big status word, plus an `Action required` line when relevant.
-- Bottom: last-update timestamp and total DONE count.
+  `last HH:MM:SS  resp N` + device IP. If the device is unpaired, the IP
+  line also shows `PAIR ME` — run `install.sh` (or call `/pair?token=…`
+  directly) to set a token.
+- Cells: grid of source cells filling the area below the single divider
+  (1 = full, 2 = side-by-side, 3 = 2-on-top + 1, 4 = 2×2). Each cell has a
+  small label and a big status word, plus an `Action required` line when
+  relevant.
 
 ## HTTP API on the ESP32
 
