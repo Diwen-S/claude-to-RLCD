@@ -12,10 +12,15 @@
 //   GET /unpair                                  clear token, back to open mode
 //   GET /show-token                              flash token on LCD (unauth)
 //   GET /reset-wifi                              wipe wifi creds, reopen portal
+//   GET /quote-tour                              cycle every quote 5s for QA
 //
 // Multi-source: each `src` value gets its own cell in a grid that adapts to
 // the count. Cells display a small label, a big status word, and an alert
 // line drawn at the cell's bottom. Up to 4 sources are tracked; oldest evicts.
+//
+// Bottom strip rotates through a 20-quote pool (English Nobel + Hao Wang;
+// simplified Chinese classical + modern intellectuals) keyed on UTC day index,
+// with "A gift from Diwen Si" as the inscription.
 
 #include <WiFi.h>
 #include <WiFiManager.h>
@@ -30,7 +35,7 @@
 #define MDNS_HOST "claude-rlcd"
 
 static Preferences g_prefs;
-static String      g_token = "";   // empty = open mode (legacy / awaiting pairing)
+static String      g_token = "";   // empty = open mode (awaiting first /pair call)
 
 // Pin map from Waveshare ESP32-S3-RLCD-4.2 official examples
 #define RLCD_SCK_PIN   11
@@ -219,7 +224,7 @@ static void renderCell(int x, int y, int w, int h, const Source& s) {
   }
 }
 
-// Cell region: y = 102 .. 234 (132 px tall). Bottom strip (235..295) holds
+// Cell region: y = 102 .. 234 (133 px tall). Bottom strip (235..295) holds
 // the daily quote + inscription.
 static void renderGrid() {
   const int Y0 = 102, H = 235 - Y0;   // 133 px tall
@@ -356,8 +361,8 @@ static void render() {
 }
 
 // Validate the ?t=... query arg against the saved token.
-// When no token is saved (open mode), accept anything — covers legacy devices
-// and the just-flashed-but-not-paired-yet state.
+// When no token is saved (open mode), accept anything — covers the
+// freshly-flashed / just-unpaired state until the first /pair call.
 static bool authorized() {
   if (g_token.length() == 0) return true;
   if (!server.hasArg("t")) return false;

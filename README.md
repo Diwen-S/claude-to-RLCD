@@ -107,15 +107,19 @@ action so you can release in time. Releasing between 1-5s aborts.
 
 ## What the screen shows
 
-- Top-left: Claude burst logo.
-- Top-right: `Claude Code` title + `5h XX%   reset HH:MM` + `week $XX` +
-  `last HH:MM:SS  resp N` + device IP. If the device is unpaired, the IP
-  line also shows `PAIR ME` — run `install.sh` (or call `/pair?token=…`
-  directly) to set a token.
-- Cells: grid of source cells filling the area below the single divider
-  (1 = full, 2 = side-by-side, 3 = 2-on-top + 1, 4 = 2×2). Each cell has a
-  small label and a big status word, plus an `Action required` line when
-  relevant.
+- **Top-left:** Claude burst logo + `Claude Code` title.
+- **Top-right, two side-by-side blocks** separated by a thin vertical rule:
+  - *Usage* (left): `5h XX%   reset HH:MM` and `week $XX`.
+  - *Activity* (right): `last HH:MM:SS` and `resp N` (total DONE count).
+- **Below the title strip:** the device IP in small text (`ip 192.168.…`).
+  If the device is unpaired, the IP line also shows `PAIR ME` — run
+  `install.sh` (or call `/pair?token=…` directly) to set a token.
+- **Cell grid** (middle): up to 4 source cells (1 = full, 2 = side-by-side,
+  3 = 2-on-top + 1, 4 = 2×2). Each cell has a small label and a big status
+  word, plus an `Action required` line when relevant.
+- **Bottom strip:** the daily quote (rotates once per UTC day), author
+  attribution, and the `A gift from Diwen Si` inscription. See *Daily quote
+  pool* below.
 
 ## HTTP API on the ESP32
 
@@ -123,9 +127,11 @@ action so you can release in time. Releasing between 1-5s aborts.
 - `GET /notify?src=<label>&status=<word>&ts=<HH:MM:SS>&alert=<text>&sp=<%>&r=<HH:MM>&wc=<usd>`
   - `src`: source id. Omit → "main". Up to 4 sources; oldest evicts.
   - `status`: shown as big word. Updates timestamp; increments counter when "DONE".
-  - `ts`: caller's local time, displayed as "Last update". Caller's clock is
-    authoritative — the ESP doesn't run NTP, so timestamps stay correct in
-    any timezone with no configuration.
+  - `ts`: caller's local time, displayed as "last HH:MM:SS". Caller's clock
+    is authoritative for the displayed timestamp — the ESP only runs NTP to
+    decide which daily quote to show, not to format the activity timestamp.
+    Timestamps therefore stay correct in any caller's timezone with no
+    configuration on the device.
   - `alert`: optional sub-line below status. Pass empty to clear.
   - `sp`, `r`, `wc`: usage stats shown in the top-right block (last value wins across sources).
 - `GET /forget?t=<token>&src=<label>` / `GET /forget?t=<token>&all=1` — clear source cells.
@@ -138,9 +144,31 @@ action so you can release in time. Releasing between 1-5s aborts.
   mode. Doesn't touch WiFi creds or source cells.
 - `GET /show-token` — flash the saved token on the LCD for ~5s. Unauth on
   purpose; needs physical line-of-sight to read.
+- `GET /quote-tour` — cycle through every quote in the pool, 5s each
+  (~100s total). For visual QA after editing the pool. Unauth; auto-clears.
 
-All write endpoints (`/notify`, `/forget`, `/reset-wifi`) require
-`?t=<token>` once the device is paired. `/` and `/show-token` stay public.
+All write endpoints (`/notify`, `/forget`, `/reset-wifi`, `/unpair`) require
+`?t=<token>` once the device is paired. `/`, `/show-token`, `/quote-tour`,
+and `/pair` (in open mode) stay public.
+
+## Daily quote pool
+
+The bottom strip rotates through 20 verified quotes (11 English, 9 Chinese,
+shuffled so consecutive days alternate languages where possible). Selection
+is deterministic per UTC day:
+
+```
+index_for_today = (unix_seconds / 86400) % 20
+```
+
+so all paired devices on the same firmware show the same quote on the same
+day. The strip also carries the gift inscription `A gift from Diwen Si`
+right-aligned, separated from the author attribution.
+
+
+To edit the pool or rotation order, see `QUOTES[]` and `QUOTE_ORDER[]` in
+`src/main.cpp`. After any change, rebuild and call `curl
+http://claude-rlcd.local/quote-tour` to cycle every entry visually.
 
 ## Access control / pairing
 
