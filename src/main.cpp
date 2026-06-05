@@ -9,6 +9,7 @@
 //   GET /notify?src=&status=&ts=&alert=&sp=&r=&wc=    update a source cell
 //   GET /forget?src=  | /forget?all=1            clear source cell(s)
 //   GET /pair?token=<4-32 alnum>                 set/rotate the pairing token
+//   GET /unpair                                  clear token, back to open mode
 //   GET /show-token                              flash token on LCD (unauth)
 //   GET /reset-wifi                              wipe wifi creds, reopen portal
 //
@@ -391,6 +392,17 @@ void setup() {
     server.send(200, "text/plain", "token shown on LCD for ~5s\n");
     delay(5000);
     render();
+  });
+
+  // Clear the saved pairing token — device returns to open mode (any LAN
+  // host can now /pair it). Doesn't touch WiFi creds or source cells.
+  server.on("/unpair", []() {
+    if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
+    g_prefs.remove("token");
+    g_token = "";
+    esp_rom_printf("[auth] unpaired — back to open mode\n");
+    render();
+    server.send(200, "text/plain", "unpaired — device is now in open mode, /pair to re-secure\n");
   });
 
   server.on("/reset-wifi", []() {

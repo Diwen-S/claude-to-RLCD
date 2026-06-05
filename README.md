@@ -51,7 +51,8 @@ claude-to-RLCD/
 │   └── ST7305_U8g2.cpp/.h       Waveshare ST7305 driver wrapper (vendored)
 ├── notify-esp32.sh              hook script — installed to ~/.claude/
 ├── settings-snippet.json        hook config — merged into ~/.claude/settings.json
-└── install.sh                   one-shot installer for each driving machine
+├── install.sh                   one-shot installer for each driving machine
+└── uninstall.sh                 reverse of install.sh on a single machine
 ```
 
 ## Session labels
@@ -117,6 +118,8 @@ curl "http://claude-rlcd.local/forget?t=$T&all=1"
   new network.
 - `GET /pair?token=<4-32 alnum>` — set a new pairing token. Allowed without
   auth when the device is unpaired; once paired, must include `&t=<current>`.
+- `GET /unpair?t=<token>` — clear the saved token, device returns to open
+  mode. Doesn't touch WiFi creds or source cells.
 - `GET /show-token` — flash the saved token on the LCD for ~5s. Unauth on
   purpose; needs physical line-of-sight to read.
 
@@ -148,6 +151,21 @@ curl "http://claude-rlcd.local/pair?token=NEWTOKEN&t=20030102"
 **Forgot the token:** any LAN host can call `curl http://claude-rlcd.local/show-token`
 to flash it on the LCD for 5s. To wipe and re-pair without the old token,
 re-flash the firmware (Preferences NVS gets cleared on a chip erase).
+
+**Unpair entirely** (e.g. before gifting the device to someone else, so they
+can pair it fresh):
+```bash
+curl "http://claude-rlcd.local/unpair?t=<current-token>"
+```
+The screen will switch back to `PAIR ME` and any LAN host can `/pair` it.
+
+**Detach a single machine** (without touching the device, leaving other
+paired machines working):
+```bash
+./uninstall.sh
+```
+Removes `~/.claude/{notify-esp32.sh,esp32-ip,esp32-token}` and strips the
+notify hooks from `~/.claude/settings.json`, preserving every other setting.
 
 Caveat: this is LAN-level access control, not encryption. Traffic is plain
 HTTP, so anyone with the WiFi password who captures the four-way handshake
