@@ -347,7 +347,7 @@ static void render() {
   if (WiFi.status() == WL_CONNECTED) {
     u8g2->setFont(u8g2_font_5x7_tf);
     String ip = "ip " + WiFi.localIP().toString();
-    if (g_token.length() == 0) ip += "  PAIR ME";
+    if (g_token.length() == 0) ip += "  PAIR ME via ./install.sh in /claude-to-RLCD";
     u8g2->drawStr(120, 96, ip.c_str());
   }
 
