@@ -1,0 +1,431 @@
+// Claude Code completion notifier — Waveshare ESP32-S3-RLCD-4.2
+// 400x300 monochrome reflective LCD, ST7305 controller, U8g2 drawing.
+//
+// WiFi is provisioned via WiFiManager (captive portal "Claude-RLCD-Setup").
+// Reachable at http://claude-rlcd.local/ once joined.
+//
+// HTTP endpoints (write endpoints require ?t=<token> once /pair has been called):
+//   GET /                              status dump (incl. ip + paired y/n)
+//   GET /notify?src=&status=&ts=&alert=&sp=&r=&wc=    update a source cell
+//   GET /forget?src=  | /forget?all=1            clear source cell(s)
+//   GET /pair?token=<4-32 alnum>                 set/rotate the pairing token
+//   GET /show-token                              flash token on LCD (unauth)
+//   GET /reset-wifi                              wipe wifi creds, reopen portal
+//
+// Multi-source: each `src` value gets its own cell in a grid that adapts to
+// the count. Cells display a small label, a big status word, and an alert
+// line drawn at the cell's bottom. Up to 4 sources are tracked; oldest evicts.
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <ESPmDNS.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <esp_rom_sys.h>
+#include "ST7305_U8g2.h"
+
+#define AP_SSID  "Claude-RLCD-Setup"
+#define MDNS_HOST "claude-rlcd"
+
+static Preferences g_prefs;
+static String      g_token = "";   // empty = open mode (legacy / awaiting pairing)
+
+// Pin map from Waveshare ESP32-S3-RLCD-4.2 official examples
+#define RLCD_SCK_PIN   11
+#define RLCD_MOSI_PIN  12
+#define RLCD_DC_PIN     5
+#define RLCD_CS_PIN    40
+#define RLCD_RST_PIN   41
+
+#define LCD_W 400
+#define LCD_H 300
+
+// Inverted theme: dark background, light foreground.
+#define FG_COLOR 0
+#define BG_COLOR 1
+
+static ST7305_U8g2 lcd(RLCD_SCK_PIN, RLCD_MOSI_PIN, RLCD_DC_PIN, RLCD_CS_PIN, RLCD_RST_PIN);
+static U8G2* u8g2 = nullptr;
+
+WebServer server(80);
+
+struct Source {
+  String   id;       // short label, e.g. "Ubuntu (Code)"
+  String   status;   // big word, e.g. "DONE", "WORKING"
+  String   alert;    // optional line drawn at the cell's bottom (e.g. "Action required")
+  uint32_t lastMs;   // millis() of last update — used for eviction order
+};
+static const int MAX_SRC = 4;
+static Source g_src[MAX_SRC];
+static int    g_nsrc = 0;
+
+static String   g_lastStamp  = "--:--:--";
+static uint32_t g_count      = 0;
+static String   g_sessionPct = "--";
+static String   g_resetAt    = "--:--";
+static String   g_weeklyUsd  = "--";
+
+static int findOrAddSource(const String& id) {
+  for (int i = 0; i < g_nsrc; i++) if (g_src[i].id == id) { g_src[i].lastMs = millis(); return i; }
+  if (g_nsrc < MAX_SRC) {
+    g_src[g_nsrc] = {id, "", "", millis()};
+    return g_nsrc++;
+  }
+  // At capacity: evict the oldest slot.
+  int oldest = 0;
+  for (int i = 1; i < MAX_SRC; i++) if (g_src[i].lastMs < g_src[oldest].lastMs) oldest = i;
+  g_src[oldest] = {id, "", "", millis()};
+  return oldest;
+}
+
+// 8-ray Claude burst (alternating long/short rays).
+static void drawClaudeBurst(int cx, int cy, int rLong) {
+  int rShort = rLong * 0.45f;
+  u8g2->setDrawColor(FG_COLOR);
+  for (int i = 0; i < 16; i++) {
+    float a = i * (PI / 8.0f);
+    int r = (i % 2 == 0) ? rLong : rShort;
+    int x = cx + (int)(cosf(a) * r);
+    int y = cy + (int)(sinf(a) * r);
+    u8g2->drawLine(cx, cy, x, y);
+    u8g2->drawLine(cx + 1, cy, x + 1, y);
+    u8g2->drawLine(cx, cy + 1, x, y + 1);
+    u8g2->drawLine(cx - 1, cy, x - 1, y);
+    u8g2->drawLine(cx, cy - 1, x, y - 1);
+  }
+  u8g2->drawDisc(cx, cy, 5);
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawDisc(cx, cy, 3);
+  u8g2->setDrawColor(FG_COLOR);
+}
+
+// Pick a status font that fits a given cell width × height.
+static const uint8_t* pickStatusFont(int w, int h) {
+  if (w >= 380 && h >= 120) return u8g2_font_osb41_tr;  // single cell
+  if (h >= 120) return u8g2_font_osb29_tr;              // 2 cells (full height)
+  return u8g2_font_osb21_tr;                            // 2x2 or short cells
+}
+
+static void renderCell(int x, int y, int w, int h, const Source& s) {
+  u8g2->setDrawColor(FG_COLOR);
+
+  // Label at the top of the cell
+  if (s.id.length()) {
+    u8g2->setFont(u8g2_font_6x13_tf);
+    int lw = u8g2->getStrWidth(s.id.c_str());
+    u8g2->drawStr(x + (w - lw) / 2, y + 13, s.id.c_str());
+  }
+
+  // Big status word, centered vertically inside the cell
+  if (s.status.length()) {
+    u8g2->setFont(pickStatusFont(w, h));
+    int sw = u8g2->getStrWidth(s.status.c_str());
+    int ascent  = u8g2->getAscent();
+    int descent = u8g2->getDescent();      // negative
+    int textH   = ascent - descent;
+    int baseY   = y + (h - textH) / 2 + ascent;
+    u8g2->drawStr(x + (w - sw) / 2, baseY, s.status.c_str());
+  }
+
+  // Alert at the bottom — bigger font for visibility (helvB14 ≈ 14px).
+  if (s.alert.length()) {
+    u8g2->setFont(u8g2_font_helvB14_tr);
+    int aw = u8g2->getStrWidth(s.alert.c_str());
+    u8g2->drawStr(x + (w - aw) / 2, y + h - 5, s.alert.c_str());
+  }
+}
+
+// Middle region: y = 95 .. 235 (140 px tall). Grid is up to 2 cols × 2 rows.
+static void renderGrid() {
+  if (g_nsrc == 0) {
+    Source placeholder = {"", "READY", "", 0};
+    renderCell(0, 95, LCD_W, 140, placeholder);
+    return;
+  }
+  if (g_nsrc == 1) {
+    renderCell(0, 95, LCD_W, 140, g_src[0]);
+    return;
+  }
+  int rows = (g_nsrc + 1) / 2;   // 2 → 1 row, 3..4 → 2 rows
+  int cellW = LCD_W / 2;
+  int cellH = 140 / rows;
+  for (int i = 0; i < g_nsrc; i++) {
+    int row = i / 2;
+    int col = i % 2;
+    renderCell(col * cellW, 95 + row * cellH, cellW, cellH, g_src[i]);
+  }
+}
+
+static void render() {
+  u8g2->clearBuffer();
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawBox(0, 0, LCD_W, LCD_H);
+  u8g2->setDrawColor(FG_COLOR);
+
+  // Top-left: Claude burst
+  drawClaudeBurst(55, 55, 38);
+
+  // Top-right: title + usage stats
+  u8g2->setFont(u8g2_font_helvB12_tr);
+  u8g2->drawStr(120, 35, "Claude Code");
+  u8g2->setFont(u8g2_font_6x13_tf);
+  String l1 = "5h " + g_sessionPct + "%   reset " + g_resetAt;
+  String l2 = "week $" + g_weeklyUsd;
+  u8g2->drawStr(120, 58, l1.c_str());
+  u8g2->drawStr(120, 78, l2.c_str());
+
+  // IP + pairing state, small, just above the divider
+  if (WiFi.status() == WL_CONNECTED) {
+    u8g2->setFont(u8g2_font_5x7_tf);
+    String ip = "ip " + WiFi.localIP().toString();
+    if (g_token.length() == 0) ip += "  PAIR ME";
+    u8g2->drawStr(120, 92, ip.c_str());
+  }
+
+  // Dividers
+  u8g2->drawHLine(20, 95, 360);
+  u8g2->drawHLine(20, 235, 360);
+
+  // Grid of source cells in the middle region
+  renderGrid();
+
+  // Footer
+  u8g2->setFont(u8g2_font_6x13_tf);
+  String foot1 = "Last update: " + g_lastStamp;
+  String foot2 = "Responses: " + String(g_count);
+  u8g2->drawStr(25, 260, foot1.c_str());
+  u8g2->drawStr(25, 285, foot2.c_str());
+
+  u8g2->sendBuffer();
+}
+
+// Validate the ?t=... query arg against the saved token.
+// When no token is saved (open mode), accept anything — covers legacy devices
+// and the just-flashed-but-not-paired-yet state.
+static bool authorized() {
+  if (g_token.length() == 0) return true;
+  if (!server.hasArg("t")) return false;
+  return server.arg("t") == g_token;
+}
+
+// Tokens must be 4–32 chars, alphanumeric only (keeps URL-encoding trivial).
+static bool validTokenShape(const String& t) {
+  if (t.length() < 4 || t.length() > 32) return false;
+  for (size_t i = 0; i < t.length(); i++) {
+    char c = t.charAt(i);
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
+  }
+  return true;
+}
+
+// Briefly flash the current token on the LCD for visual recovery.
+static void renderTokenBanner(const String& tok) {
+  u8g2->clearBuffer();
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawBox(0, 0, LCD_W, LCD_H);
+  u8g2->setDrawColor(FG_COLOR);
+  u8g2->setFont(u8g2_font_helvB14_tr);
+  const char* label = "Pairing token";
+  int lw = u8g2->getStrWidth(label);
+  u8g2->drawStr((LCD_W - lw) / 2, 100, label);
+  u8g2->setFont(u8g2_font_osb29_tr);
+  int tw = u8g2->getStrWidth(tok.c_str());
+  u8g2->drawStr((LCD_W - tw) / 2, 175, tok.c_str());
+  u8g2->setFont(u8g2_font_6x13_tf);
+  const char* hint = "Type this into install.sh on your machine";
+  int hw = u8g2->getStrWidth(hint);
+  u8g2->drawStr((LCD_W - hw) / 2, 225, hint);
+  u8g2->sendBuffer();
+}
+
+// Full-screen takeover shown while the WiFi config portal is open.
+static void renderPortalScreen(const String& apIp) {
+  u8g2->clearBuffer();
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawBox(0, 0, LCD_W, LCD_H);
+  u8g2->setDrawColor(FG_COLOR);
+
+  drawClaudeBurst(55, 55, 38);
+
+  u8g2->setFont(u8g2_font_helvB14_tr);
+  u8g2->drawStr(120, 45, "WiFi setup needed");
+
+  u8g2->setFont(u8g2_font_6x13_tf);
+  u8g2->drawStr(120, 72, "From your phone, join:");
+  u8g2->setFont(u8g2_font_helvB14_tr);
+  u8g2->drawStr(120, 92, AP_SSID);
+
+  u8g2->drawHLine(20, 115, 360);
+
+  u8g2->setFont(u8g2_font_6x13_tf);
+  u8g2->drawStr(30, 145, "1. Open WiFi settings on phone");
+  u8g2->drawStr(30, 165, "2. Join " AP_SSID);
+  u8g2->drawStr(30, 185, "3. Browser opens; pick your WiFi");
+  u8g2->drawStr(30, 205, "4. Device reboots and shows IP");
+
+  u8g2->drawHLine(20, 225, 360);
+
+  u8g2->setFont(u8g2_font_5x7_tf);
+  String hint = "Portal IP: " + apIp + "  (auto-opens on most phones)";
+  u8g2->drawStr(30, 250, hint.c_str());
+  u8g2->drawStr(30, 270, "Reach later at: http://" MDNS_HOST ".local/");
+
+  u8g2->sendBuffer();
+}
+
+static void handleRoot() {
+  String s = "Claude RLCD notifier\n";
+  s += "sources = " + String(g_nsrc) + "\n";
+  for (int i = 0; i < g_nsrc; i++) {
+    s += "  [" + g_src[i].id + "] status=" + g_src[i].status;
+    if (g_src[i].alert.length()) s += " alert=\"" + g_src[i].alert + "\"";
+    s += "\n";
+  }
+  s += "last   = " + g_lastStamp + "\n";
+  s += "count  = " + String(g_count) + "\n";
+  s += "5h%    = " + g_sessionPct + "\n";
+  s += "reset  = " + g_resetAt + "\n";
+  s += "week$  = " + g_weeklyUsd + "\n";
+  s += "ip     = " + WiFi.localIP().toString() + "\n";
+  s += "paired = " + String(g_token.length() ? "yes" : "no (open mode — call /pair)") + "\n";
+  server.send(200, "text/plain", s);
+}
+
+static void handleNotify() {
+  if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
+  String srcId = (server.hasArg("src") && server.arg("src").length())
+                  ? server.arg("src") : String("main");
+  int idx = findOrAddSource(srcId);
+  Source& src = g_src[idx];
+
+  if (server.hasArg("status") && server.arg("status").length()) {
+    String st = server.arg("status"); st.toUpperCase();
+    src.status = st;
+    if (server.hasArg("ts") && server.arg("ts").length()) g_lastStamp = server.arg("ts");
+    if (st == "DONE") g_count++;
+  }
+  if (server.hasArg("alert")) src.alert = server.arg("alert");
+  if (server.hasArg("sp") && server.arg("sp").length()) g_sessionPct = server.arg("sp");
+  if (server.hasArg("r")  && server.arg("r").length())  g_resetAt    = server.arg("r");
+  if (server.hasArg("wc") && server.arg("wc").length()) g_weeklyUsd  = server.arg("wc");
+
+  render();
+  server.send(200, "text/plain", "ok\n");
+}
+
+void setup() {
+  esp_rom_printf("[boot] Claude RLCD notifier\n");
+
+  g_prefs.begin("claude-rlcd", false);
+  g_token = g_prefs.getString("token", "");
+  esp_rom_printf("[auth] %s\n", g_token.length() ? "paired" : "OPEN MODE — call /pair?token=...");
+
+  lcd.begin(0, U8G2_R1);
+  u8g2 = lcd.getU8g2();
+  esp_rom_printf("[boot] LCD ok\n");
+
+  render();
+  esp_rom_printf("[boot] BOOT painted\n");
+
+  WiFi.mode(WIFI_STA);
+
+  WiFiManager wm;
+  wm.setConfigPortalBlocking(true);
+  wm.setConfigPortalTimeout(0);   // wait forever; user is expected to finish setup
+  wm.setAPCallback([](WiFiManager* m) {
+    esp_rom_printf("[wifi] portal open, AP=%s ip=%s\n",
+                   AP_SSID, WiFi.softAPIP().toString().c_str());
+    renderPortalScreen(WiFi.softAPIP().toString());
+  });
+
+  if (!wm.autoConnect(AP_SSID)) {
+    esp_rom_printf("[wifi] autoConnect failed, rebooting\n");
+    delay(1500);
+    ESP.restart();
+  }
+  esp_rom_printf("[wifi] ip=%s\n", WiFi.localIP().toString().c_str());
+
+  if (MDNS.begin(MDNS_HOST)) {
+    MDNS.addService("http", "tcp", 80);
+    esp_rom_printf("[mdns] http://%s.local/\n", MDNS_HOST);
+  } else {
+    esp_rom_printf("[mdns] begin failed\n");
+  }
+
+  server.on("/",       handleRoot);
+  server.on("/notify", handleNotify);
+
+  // Pair / re-pair. In open mode anyone on LAN can pair; once paired, the
+  // existing token is required to change it. ?token=NEWVAL sets a new token.
+  server.on("/pair", []() {
+    if (g_token.length() != 0 && !authorized()) {
+      server.send(403, "text/plain", "forbidden: device already paired, supply current ?t=<token>\n");
+      return;
+    }
+    if (!server.hasArg("token")) {
+      server.send(400, "text/plain", "usage: /pair?token=<4-32 alnum>[&t=<current-token>]\n");
+      return;
+    }
+    String nt = server.arg("token");
+    if (!validTokenShape(nt)) {
+      server.send(400, "text/plain", "token must be 4-32 alphanumeric chars\n");
+      return;
+    }
+    g_token = nt;
+    g_prefs.putString("token", g_token);
+    esp_rom_printf("[auth] paired with new token (%d chars)\n", g_token.length());
+    renderTokenBanner(g_token);
+    delay(2500);
+    render();
+    server.send(200, "text/plain", "paired ok\n");
+  });
+
+  // Flash the current token on the LCD for visual recovery — unauth on
+  // purpose: needs physical line-of-sight to be useful.
+  server.on("/show-token", []() {
+    if (g_token.length() == 0) {
+      server.send(200, "text/plain", "no token set (open mode)\n");
+      return;
+    }
+    renderTokenBanner(g_token);
+    server.send(200, "text/plain", "token shown on LCD for ~5s\n");
+    delay(5000);
+    render();
+  });
+
+  server.on("/reset-wifi", []() {
+    if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
+    server.send(200, "text/plain", "wiping wifi creds, rebooting\n");
+    delay(300);
+    WiFiManager wm2;
+    wm2.resetSettings();
+    delay(300);
+    ESP.restart();
+  });
+
+  server.on("/forget", []() {
+    if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
+    if (server.hasArg("all")) { g_nsrc = 0; }
+    else if (server.hasArg("src")) {
+      for (int i = 0; i < g_nsrc; i++) {
+        if (g_src[i].id == server.arg("src")) {
+          for (int j = i; j < g_nsrc - 1; j++) g_src[j] = g_src[j + 1];
+          g_nsrc--;
+          break;
+        }
+      }
+    }
+    render();
+    server.send(200, "text/plain", "ok\n");
+  });
+  server.begin();
+  esp_rom_printf("[http] listening on :80\n");
+
+  render();
+  esp_rom_printf("[boot] READY\n");
+}
+
+void loop() {
+  server.handleClient();
+  delay(2);
+}
