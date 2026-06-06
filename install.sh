@@ -181,22 +181,38 @@ echo "Merged hooks into $SETTINGS  (backup saved alongside)"
 
 bootstrap_venv() {
   local venv="$1"
+  local vendor="$SCRIPT_DIR/tools/vendor"
   if [ -x "$venv/bin/python" ]; then return 0; fi
   echo "Creating Python venv at $venv ..."
   if ! python3 -m venv "$venv" 2>/dev/null; then
     echo "  python3 -m venv failed (likely missing python3-venv)."
     case "$(uname -s)" in
-      Linux*)  echo "  Fix: sudo apt install python3-venv  (then re-run ./install.sh)";;
-      Darwin*) echo "  Fix: brew install python   (then re-run ./install.sh)";;
+      Linux*)  echo "  Fix: sudo apt install python3-venv     (Debian/Ubuntu)"
+               echo "       sudo dnf install python3-virtualenv  (Fedora)"
+               echo "       (Arch / openSUSE ship venv with python3 already)";;
+      Darwin*) echo "  Fix: brew install python  (then re-run ./install.sh)";;
     esac
     return 1
   fi
   "$venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
-  if ! "$venv/bin/pip" install --quiet icalendar recurring_ical_events python-dateutil requests; then
-    echo "  pip install failed — check network, then re-run ./install.sh"
-    return 1
+
+  # Try the bundled wheels first so install works on offline / locked-down
+  # networks; fall back to PyPI if the vendor dir is missing or stale.
+  if [ -d "$vendor" ] && ls "$vendor"/*.whl >/dev/null 2>&1; then
+    if "$venv/bin/pip" install --quiet --no-index --find-links "$vendor" \
+         icalendar recurring_ical_events python-dateutil 2>/dev/null; then
+      echo "  installed from bundled wheels in $vendor (offline)"
+      return 0
+    fi
+    echo "  bundled wheels in $vendor didn't satisfy resolver — falling back to PyPI"
   fi
-  echo "  installed: icalendar, recurring_ical_events, python-dateutil, requests"
+  if "$venv/bin/pip" install --quiet icalendar recurring_ical_events python-dateutil; then
+    echo "  installed from PyPI: icalendar, recurring_ical_events, python-dateutil"
+    return 0
+  fi
+  echo "  pip install failed — no network and bundled wheels missing / incompatible."
+  echo "  Re-run after restoring internet, or re-run ./tools/vendor/refresh.sh on a connected box."
+  return 1
 }
 
 install_timer_systemd() {

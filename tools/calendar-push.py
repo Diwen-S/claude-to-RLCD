@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
-"""Fetch ICS calendars, format today's events, optionally push to the RLCD."""
+"""Fetch ICS calendars, format today's events, optionally push to the RLCD.
+
+Reads ICS URLs from ~/.config/claude-rlcd/calendar.conf (one per line, `#` for
+comments). Merges all listed calendars, sorts by start time, formats up to 8
+rows for the device's /todo endpoint, and inserts a "now" divider at the
+boundary between past and upcoming events.
+
+Network I/O uses only the Python stdlib (urllib.request) — no `requests`
+dependency. The three non-stdlib imports (icalendar, recurring_ical_events,
+dateutil) are pure Python and bundled as wheels under tools/vendor/ so that
+install.sh can bootstrap the venv offline.
+
+Modes (see --help):
+    no flag   dry-run; prints what would be sent to stdout. Used for setup
+              validation and by `install.sh` to confirm the conf parses.
+    --push    POST the list to http://<device>/todo. Used by the 5-min timer
+              (systemd-user / launchd / cron) installed by install.sh.
+
+Exit codes:
+    0  success
+    1  --push got non-200 from the device
+    2  no calendars configured (empty / missing conf file)
+"""
 
 import argparse
 import os
 import pathlib
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
 
 import icalendar
 import recurring_ical_events
-import requests
 from dateutil import tz
 
 CONFIG_PATH = pathlib.Path.home() / ".config" / "claude-rlcd" / "calendar.conf"
@@ -42,7 +65,7 @@ def read_config(path):
 
 def normalize_url(url):
     # Apple iCloud / many calendar clients hand out webcal:// — same wire format as https.
-    p = urlparse(url)
+    p = urllib.parse.urlparse(url)
     if p.scheme in ("webcal", "webcals"):
         return url.replace(p.scheme + "://", "https://", 1)
     if p.scheme == "file":
@@ -54,9 +77,11 @@ def load_calendar(url):
     if url.startswith("file://"):
         body = pathlib.Path(url[7:]).read_bytes()
     else:
-        r = requests.get(url, timeout=FETCH_TIMEOUT)
-        r.raise_for_status()
-        body = r.content
+        # Some servers (e.g. Microsoft 365) reject the default Python User-Agent
+        # with 403; pretend to be a generic client to dodge that.
+        req = urllib.request.Request(url, headers={"User-Agent": "claude-rlcd/1.0"})
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+            body = r.read()
     return icalendar.Calendar.from_ical(body)
 
 
@@ -137,8 +162,15 @@ def push(lines, host, token, date_str):
     params = {"items": body, "date": date_str}
     if token:
         params["t"] = token
-    r = requests.post(f"http://{host}/todo", params=params, timeout=5)
-    return r.status_code, r.text.strip()
+    # The device's WebServer treats the query string the same on GET or POST;
+    # we POST with an empty body so the URL doesn't end up in shell history.
+    url = f"http://{host}/todo?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, method="POST", data=b"")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace").strip()
 
 
 def main():

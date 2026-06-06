@@ -61,7 +61,8 @@ claude-to-RLCD/
 ├── uninstall.sh                 reverse of install.sh on a single machine
 └── tools/
     ├── calendar-push.py         ICS sidecar (calendar view); driven by a 5-min timer
-    └── .venv/                   self-contained Python env for the sidecar
+    ├── vendor/                  bundled pure-Python wheels for offline install (icalendar etc.)
+    └── .venv/                   self-contained Python env (created by install.sh; gitignored)
 ```
 
 ## Session labels
@@ -223,6 +224,12 @@ formats them, and POSTs the list to the device's `/todo` endpoint. The script
 holds the calendar URLs; the device never sees them, never speaks TLS to the
 outside world.
 
+Network I/O uses only Python's standard library (`urllib.request`); the three
+parsing deps (`icalendar`, `recurring_ical_events`, `python-dateutil`) are
+pure-Python and bundled as wheels in `tools/vendor/`, so `install.sh` can
+bootstrap the sidecar without hitting PyPI — useful on locked-down corporate
+networks or during gift-unboxing without internet.
+
 ### Quick setup (via `install.sh`)
 
 `install.sh` walks you through the whole calendar setup at the end of the
@@ -230,8 +237,12 @@ ESP-pairing flow. Just answer `y` when it asks "Connect a calendar now?", paste
 your ICS URL (the prompt lists where to find it per provider), and answer `y`
 again to "Install a 5-minute auto-refresh timer?". The installer:
 
-1. Bootstraps the venv at `tools/.venv` and installs the four Python deps.
-   (On Debian/Ubuntu you may first need `sudo apt install python3-venv`.)
+1. Bootstraps the venv at `tools/.venv` and installs the three Python deps,
+   **offline if possible** — `install.sh` first tries the bundled wheels in
+   `tools/vendor/`, only falling back to PyPI if the vendor dir is missing
+   or stale. So the calendar works even on machines without internet at
+   install time (corporate proxies, university firewalls, gift unboxing).
+   On Debian/Ubuntu you may first need `sudo apt install python3-venv`.
 2. Writes the URL to `~/.config/claude-rlcd/calendar.conf` (mode `0600`).
 3. Runs a live `--push` to confirm the LCD picks it up.
 4. Installs the right kind of refresh timer for your OS:
@@ -248,9 +259,11 @@ through the prompts again.
 ### Manual setup (skipping `install.sh`)
 
 ```bash
-# 1. Bootstrap the venv (once).
+# 1. Bootstrap the venv (once). Offline install from the bundled wheels:
 python3 -m venv tools/.venv
-tools/.venv/bin/pip install icalendar recurring_ical_events python-dateutil requests
+tools/.venv/bin/pip install --no-index --find-links tools/vendor/ \
+    icalendar recurring_ical_events python-dateutil
+# (Drop --no-index --find-links to pull current versions from PyPI instead.)
 
 # 2. Drop the URL in the conf (one per line; '#' for comments).
 mkdir -p ~/.config/claude-rlcd && chmod 700 ~/.config/claude-rlcd
