@@ -183,7 +183,10 @@ bootstrap_venv() {
   local venv="$1"
   local vendor="$SCRIPT_DIR/tools/vendor"
   if [ -x "$venv/bin/python" ]; then return 0; fi
-  echo "Creating Python venv at $venv ..."
+  # Wall-clock varies wildly with filesystem: ~5-10 s on native Linux/macOS,
+  # but up to ~60 s on WSL when the repo lives on /mnt/c or /mnt/d (per-file
+  # NTFS-via-9P overhead). The PyPI fallback adds another 5-30 s on top.
+  echo "Creating Python venv at $venv ... (~10 s on native filesystems, ~1 min on WSL/Windows mounts)"
   if ! python3 -m venv "$venv" 2>/dev/null; then
     echo "  python3 -m venv failed (likely missing python3-venv)."
     case "$(uname -s)" in
@@ -194,10 +197,10 @@ bootstrap_venv() {
     esac
     return 1
   fi
-  "$venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
 
   # Try the bundled wheels first so install works on offline / locked-down
-  # networks; fall back to PyPI if the vendor dir is missing or stale.
+  # networks. Skip the pip self-upgrade in this path — every modern pip
+  # handles --find-links fine, and skipping it keeps the offline path offline.
   if [ -d "$vendor" ] && ls "$vendor"/*.whl >/dev/null 2>&1; then
     if "$venv/bin/pip" install --quiet --no-index --find-links "$vendor" \
          icalendar recurring_ical_events python-dateutil 2>/dev/null; then
@@ -206,6 +209,8 @@ bootstrap_venv() {
     fi
     echo "  bundled wheels in $vendor didn't satisfy resolver — falling back to PyPI"
   fi
+  # PyPI path: upgrade pip first since we're about to hit the network anyway.
+  "$venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
   if "$venv/bin/pip" install --quiet icalendar recurring_ical_events python-dateutil; then
     echo "  installed from PyPI: icalendar, recurring_ical_events, python-dateutil"
     return 0

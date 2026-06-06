@@ -5,6 +5,12 @@
 # unit / launchd agent / cron entry) if install.sh set one up. The calendar
 # conf file and the sidecar's Python venv are kept by default — pass
 # --purge-calendar to delete those too.
+#
+# If you're about to delete the cloned repo folder from Windows Explorer,
+# pass --purge-calendar; otherwise tools/.venv/ stays and its deeply nested
+# wheel paths trip Explorer's 260-char MAX_PATH limit (error 0x80070780).
+# Plain `rm -rf` from WSL/Linux/macOS doesn't have the same problem.
+#
 # To wipe the device's pairing token entirely, hit GET /unpair on the device.
 set -e
 

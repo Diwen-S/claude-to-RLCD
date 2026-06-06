@@ -402,10 +402,21 @@ The screen will switch back to `PAIR ME` and any LAN host can `/pair` it.
 **Detach a single machine** (without touching the device, leaving other
 paired machines working):
 ```bash
-./uninstall.sh
+./uninstall.sh                    # keep tools/.venv and calendar.conf
+./uninstall.sh --purge-calendar   # also wipe tools/.venv and ~/.config/claude-rlcd/
 ```
-Removes `~/.claude/{notify-esp32.sh,esp32-ip,esp32-token}` and strips the
-notify hooks from `~/.claude/settings.json`, preserving every other setting.
+Removes `~/.claude/{notify-esp32.sh,esp32-ip,esp32-token}`, strips the
+notify hooks from `~/.claude/settings.json`, and tears down the calendar
+auto-refresh timer (systemd-user / launchd / cron) if `install.sh` set one
+up. Every other setting in `settings.json` is preserved.
+
+**Then deleting the cloned repo folder:** if you're on WSL/Linux/macOS, plain
+`rm -rf` works. If you're deleting from **Windows Explorer**, run
+`./uninstall.sh --purge-calendar` first — without it, `tools/.venv/` survives
+and its nested wheel paths exceed Windows' 260-char `MAX_PATH` limit, leaving
+Explorer to throw error `0x80070780` ("file cannot be accessed by the
+system"). After the purge, the folder is just text + small wheels and
+Explorer can delete it normally.
 
 Caveat: this is LAN-level access control, not encryption. Traffic is plain
 HTTP, so anyone with the WiFi password who captures the four-way handshake
