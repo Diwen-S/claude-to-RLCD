@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Per-machine Python venv for the calendar sidecar (install.sh recreates it).
+tools/.venv/

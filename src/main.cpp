@@ -8,6 +8,7 @@
 //   GET /                              status dump (incl. ip + paired y/n)
 //   GET /notify?src=&status=&ts=&alert=&sp=&r=&wc=    update a source cell
 //   GET /forget?src=  | /forget?all=1            clear source cell(s)
+//   POST /todo?items=<lines>&date=<header>       replace today's calendar list (see handler for line format)
 //   GET /pair?token=<4-32 alnum>                 set/rotate the pairing token
 //   GET /unpair                                  clear token, back to open mode
 //   GET /show-token                              flash token on LCD (unauth)
@@ -72,6 +73,33 @@ static uint32_t g_count      = 0;
 static String   g_sessionPct = "--";
 static String   g_resetAt    = "--:--";
 static String   g_weeklyUsd  = "--";
+
+// Today's calendar items, pushed by tools/calendar-push.py. Plain strings of
+// the form "HH:MM <title>" or "--:-- <title>" for all-day events. Never
+// persisted; sidecar reposts on its own timer.
+static const int MAX_TODO = 8;
+static String   g_todo[MAX_TODO];
+static int      g_todoCount     = 0;
+static uint32_t g_todoFetchedMs = 0;   // millis() at last successful push; 0 = never
+static String   g_todoDate      = "";  // sidecar-provided header, e.g. "Sat  Jun 6"
+
+// View = what stays on the LCD between KEY events. Toggled by single-tap; no
+// auto-revert. Not persisted (a reboot returns to VIEW_MAIN).
+enum ViewMode { VIEW_MAIN, VIEW_TODO };
+static ViewMode g_view = VIEW_MAIN;
+
+// Overlay = transient takeover that auto-dismisses back to the current view.
+// Used by double-tap → pairing token. Kept non-blocking (no delay()) so the
+// KEY handler can fire again before the overlay expires.
+enum OverlayMode  { OVL_NONE, OVL_TOKEN };
+static OverlayMode g_overlay        = OVL_NONE;
+static uint32_t    g_overlayUntilMs = 0;
+
+// Double-tap detection: the first short release arms a window; a second short
+// release inside the window fires double-tap, expiry fires single-tap. 350ms
+// is the conventional double-click threshold — short enough not to feel laggy.
+static const uint32_t TAP_DOUBLE_MS  = 350;
+static uint32_t       g_tapArmedUntilMs = 0;  // 0 = not armed
 
 // ---- Daily quote pool --------------------------------------------------------
 // Drawn from once per UTC day (index = days_since_epoch % NQ). Each quote line
@@ -314,7 +342,7 @@ static void renderBottomStrip() {
   u8g2->drawStr(LCD_W - iw - 20, 286, INSCRIPTION);
 }
 
-static void render() {
+static void renderMainView() {
   u8g2->clearBuffer();
   u8g2->setDrawColor(BG_COLOR);
   u8g2->drawBox(0, 0, LCD_W, LCD_H);
@@ -407,6 +435,109 @@ static void renderTokenBanner(const String& tok) {
   u8g2->sendBuffer();
 }
 
+// Full-screen takeover shown on the calendar view. Each stored line is three
+// tab-separated fields: "<start>\t<end>\t<title>". Start is bold and large;
+// end is rendered after a thin en-dash in a smaller weight so the eye snags
+// on the start time (the conventional "ambient calendar" cue used by
+// Fantastical/BusyCal). A row whose start field is literally "now" is
+// rendered as a horizontal divider with the current HH:MM labelled at left.
+static void renderTodoBanner() {
+  u8g2->clearBuffer();
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawBox(0, 0, LCD_W, LCD_H);
+  u8g2->setDrawColor(FG_COLOR);
+
+  // Header band — date at left in display weight, freshness right-aligned and
+  // tucked into the small font so the eye reads "<date>" first.
+  u8g2->setFont(u8g2_font_helvB18_tr);
+  const char* dateStr = g_todoDate.length() ? g_todoDate.c_str() : "Today";
+  u8g2->drawStr(20, 36, dateStr);
+  u8g2->setFont(u8g2_font_6x10_tf);
+  String age;
+  if (g_todoFetchedMs) {
+    uint32_t ageMin = (millis() - g_todoFetchedMs) / 60000;
+    age = "updated " + String(ageMin) + "m ago";
+  } else {
+    age = "no sidecar push yet";
+  }
+  int aw = u8g2->getStrWidth(age.c_str());
+  u8g2->drawStr(LCD_W - 20 - aw, 36, age.c_str());
+  u8g2->drawHLine(20, 48, LCD_W - 40);
+
+  if (g_todoCount == 0) {
+    u8g2->setFont(u8g2_font_helvR14_tr);
+    u8g2->drawStr(20, 96, "no events today");
+    u8g2->sendBuffer();
+    return;
+  }
+
+  const int kRowH      = 30;
+  const int kStartX    = 20;
+  const int kEndOffX   = 8;    // gap between start and the dash
+  const int kEndGapX   = 4;    // gap between dash and end string
+  const int kTitleX    = 160;  // shared baseline for titles
+  const int kFirstBase = 82;
+
+  for (int i = 0; i < g_todoCount; i++) {
+    int y = kFirstBase + i * kRowH;
+    String line = g_todo[i];
+    int t1 = line.indexOf('\t');
+    int t2 = (t1 >= 0) ? line.indexOf('\t', t1 + 1) : -1;
+    String sField = (t1 >= 0) ? line.substring(0, t1)        : line;
+    String eField = (t2 >= 0) ? line.substring(t1 + 1, t2)   : String("");
+    String mField = (t2 >= 0) ? line.substring(t2 + 1)
+                             : (t1 >= 0 ? line.substring(t1 + 1) : String(""));
+
+    if (sField == "now") {
+      // Now-divider. Dashed HLine across the row with a bold time pill at the
+      // left so the eye locates "now" at a glance and the past/future split is
+      // unambiguous. Row pitch unchanged so spacing stays consistent.
+      int by = y - 8;  // visual middle of the row
+      u8g2->setFont(u8g2_font_helvB12_tr);
+      String nowLabel = "now  " + mField;
+      int nw = u8g2->getStrWidth(nowLabel.c_str());
+      u8g2->drawStr(kStartX, y - 2, nowLabel.c_str());
+      // dashed line to the right of the label
+      int lineStart = kStartX + nw + 10;
+      int lineEnd   = LCD_W - 20;
+      for (int x = lineStart; x < lineEnd; x += 6) {
+        int seg = (lineEnd - x < 3) ? (lineEnd - x) : 3;
+        u8g2->drawHLine(x, by, seg);
+      }
+      continue;
+    }
+
+    // Start time: bold and full size, draws the eye.
+    u8g2->setFont(u8g2_font_helvB14_tr);
+    u8g2->drawStr(kStartX, y, sField.c_str());
+
+    // End time + dash: render only if present, smaller and regular weight so
+    // it reads as secondary information.
+    if (eField.length()) {
+      int sw = u8g2->getStrWidth(sField.c_str());
+      u8g2->setFont(u8g2_font_helvR10_tr);
+      int dashX = kStartX + sw + kEndOffX;
+      u8g2->drawStr(dashX, y - 1, "-");
+      int dashW = u8g2->getStrWidth("-");
+      u8g2->drawStr(dashX + dashW + kEndGapX, y - 1, eField.c_str());
+    }
+
+    // Title: regular weight, slightly larger than the end-time to dominate
+    // visually over the secondary metadata.
+    u8g2->setFont(u8g2_font_helvR14_tr);
+    u8g2->drawStr(kTitleX, y, mField.c_str());
+  }
+  u8g2->sendBuffer();
+}
+
+// Public repaint entrypoint: dispatch on the active view. Every existing
+// call site (HTTP handlers, KEY holds, quote tour, boot) goes through here,
+// so the calendar view isn't yanked away by a /notify or daily-quote tick.
+static void render() {
+  if (g_view == VIEW_TODO) renderTodoBanner();
+  else                     renderMainView();
+}
+
 // Full-screen takeover shown while the WiFi config portal is open.
 static void renderPortalScreen(const String& apIp) {
   u8g2->clearBuffer();
@@ -455,6 +586,15 @@ static void handleRoot() {
   s += "5h%    = " + g_sessionPct + "\n";
   s += "reset  = " + g_resetAt + "\n";
   s += "week$  = " + g_weeklyUsd + "\n";
+  s += "todo   = " + String(g_todoCount) + " items";
+  if (g_todoFetchedMs) {
+    s += " (updated " + String((millis() - g_todoFetchedMs) / 60000) + "m ago)\n";
+  } else {
+    s += " (no push yet)\n";
+  }
+  for (int i = 0; i < g_todoCount; i++) {
+    s += "         " + g_todo[i] + "\n";
+  }
   s += "ip     = " + WiFi.localIP().toString() + "\n";
   s += "paired = " + String(g_token.length() ? "yes" : "no (open mode — call /pair)") + "\n";
   server.send(200, "text/plain", s);
@@ -483,10 +623,14 @@ static void handleNotify() {
 }
 
 // ---- KEY button handler -----------------------------------------------------
-// Press tiers (no laptop / no network needed):
-//   tap (<1s):  flash pairing token on the LCD for 5s
-//   hold 5s:   clear all source cells (= /forget?all=1)
-//   hold 15s:  factory reset — wipe WiFi creds + token, reboot into portal
+// Gestures (no laptop / no network needed):
+//   single tap:     toggle main Claude view ↔ calendar view (both persist; no auto-revert)
+//   double tap:     flash pairing token on the LCD for 5s, then back to the active view
+//   hold 5s:        clear all source cells (= /forget?all=1)
+//   hold 15s:       factory reset — wipe WiFi creds + token, reboot into portal
+// Tap timing: the first short release arms a ~350ms window. A second release
+// inside that window fires double-tap; expiry fires single-tap. The slight
+// latency on single-tap is the cost of unambiguous single/double detection.
 // Holding past 1s shows an on-screen prompt with a progress bar so the user
 // can release in time. Releasing at 1-5s aborts.
 static int      g_keyState        = HIGH;
@@ -542,13 +686,30 @@ static void handleKey() {
       uint32_t held = now - g_keyDownMs;
       g_keyDownMs = 0;
       if (held < 1000) {
-        if (g_token.length()) { renderTokenBanner(g_token); delay(5000); }
+        // Single tap = toggle main↔todo view (persistent). Double tap = show
+        // pairing token for 5s. The first release arms a window; if a second
+        // release lands inside it we've seen a double; otherwise the loop
+        // fires the single after the window expires (so the gestures don't
+        // collide).
+        if (g_tapArmedUntilMs && (int32_t)(now - g_tapArmedUntilMs) <= 0) {
+          g_tapArmedUntilMs = 0;
+          if (g_token.length()) {
+            renderTokenBanner(g_token);
+            g_overlay        = OVL_TOKEN;
+            g_overlayUntilMs = now + 5000;
+          }
+        } else {
+          g_tapArmedUntilMs = now + TAP_DOUBLE_MS;
+        }
       } else if (g_keyTier == 1) {
         g_nsrc = 0;
         esp_rom_printf("[key] cleared all source cells\n");
       }
       g_keyTier = 0;
-      render();
+      // Don't repaint if a tap just put us into an overlay — it would erase
+      // the banner the user is trying to read. Otherwise refresh whichever
+      // view the user has chosen (main or calendar).
+      if (g_overlay == OVL_NONE) render();
     }
   }
 
@@ -702,6 +863,36 @@ void setup() {
     server.send(200, "text/plain", s.c_str());
   });
 
+  // Receive today's calendar list from tools/calendar-push.py. `items` is a
+  // newline-separated body where each line is three tab-separated fields:
+  //   "<start>\t<end>\t<title>"
+  // <start> = "HH:MM" | "all day" | "now"
+  // <end>   = "HH:MM" | "" (empty if unknown / instantaneous / all-day)
+  // <title> = the event title, or for the special "now" row, the current HH:MM
+  // We store up to MAX_TODO lines and also save the optional `date` arg as
+  // the header label (e.g. "Sat  Jun 6"). Accepts GET or POST; sidecar uses
+  // POST with a query string so the body doesn't end up in shell history.
+  server.on("/todo", []() {
+    if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
+    String items = server.hasArg("items") ? server.arg("items") : String("");
+    if (server.hasArg("date")) g_todoDate = server.arg("date");
+    g_todoCount = 0;
+    int start = 0;
+    while (start <= (int)items.length() && g_todoCount < MAX_TODO) {
+      int nl = items.indexOf('\n', start);
+      if (nl < 0) nl = items.length();
+      String line = items.substring(start, nl);
+      line.trim();
+      if (line.length() > 0) g_todo[g_todoCount++] = line;
+      if (nl >= (int)items.length()) break;
+      start = nl + 1;
+    }
+    g_todoFetchedMs = millis();
+    if (g_view == VIEW_TODO) render();  // refresh in-place if user is on the calendar view
+    String resp = "ok (" + String(g_todoCount) + " items)\n";
+    server.send(200, "text/plain", resp.c_str());
+  });
+
   server.on("/forget", []() {
     if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
     if (server.hasArg("all")) { g_nsrc = 0; }
@@ -727,6 +918,22 @@ void setup() {
 void loop() {
   server.handleClient();
   handleKey();
+
+  // Auto-dismiss the token overlay once its 5s window expires, returning to
+  // whichever view (main or todo) the user had toggled to. Done in loop()
+  // rather than via delay() so KEY remains responsive while the banner is up.
+  if (g_overlay != OVL_NONE && (int32_t)(millis() - g_overlayUntilMs) >= 0) {
+    g_overlay = OVL_NONE;
+    render();
+  }
+
+  // Fire the single-tap action once the double-tap window has lapsed without
+  // a second release. Single-tap = toggle main↔todo view.
+  if (g_tapArmedUntilMs && (int32_t)(millis() - g_tapArmedUntilMs) >= 0) {
+    g_tapArmedUntilMs = 0;
+    g_view = (g_view == VIEW_MAIN) ? VIEW_TODO : VIEW_MAIN;
+    render();
+  }
 
   // Advance the quote tour, if one is running.
   if (g_quoteTourIdx >= 0) {

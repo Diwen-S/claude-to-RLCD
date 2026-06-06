@@ -7,6 +7,12 @@ A 4.2" 400×300 reflective LCD that lights up with `WORKING` / `DONE` /
 Wired to Claude Code via Stop / UserPromptSubmit / Notification / PreToolUse
 hooks. Supports multiple parallel Claude Code sessions with distinct labels.
 
+Single-tap the on-board KEY button to flip the screen into an ambient
+**calendar view** of today's events — date header, start + end times, a "now"
+divider that walks down the list as the day progresses — sourced from any
+ICS-publishing calendar (Google / Outlook / Apple / Fastmail / Nextcloud).
+Tap again to flip back. See *Connecting a calendar* below.
+
 ## Quick start (recipient)
 
 The firmware is already on the board. To set it up on a new WiFi:
@@ -52,7 +58,10 @@ claude-to-RLCD/
 ├── notify-esp32.sh              hook script — installed to ~/.claude/
 ├── settings-snippet.json        hook config — merged into ~/.claude/settings.json
 ├── install.sh                   one-shot installer for each driving machine
-└── uninstall.sh                 reverse of install.sh on a single machine
+├── uninstall.sh                 reverse of install.sh on a single machine
+└── tools/
+    ├── calendar-push.py         ICS sidecar (calendar view); driven by a 5-min timer
+    └── .venv/                   self-contained Python env for the sidecar
 ```
 
 ## Session labels
@@ -94,16 +103,27 @@ curl "http://claude-rlcd.local/forget?t=$T&all=1"
 
 ## Physical KEY button
 
-The on-board KEY button (GPIO18) is the no-laptop, no-network recovery path:
+The on-board KEY button (GPIO18) is the no-laptop, no-network entry point:
 
 | Gesture | Action |
 |---|---|
-| Tap (<1s) | Flash pairing token on the LCD for 5s. Equivalent to `curl /show-token`. |
+| **Single tap** | Toggle between Claude status view and calendar view. Both persist until tapped again; nothing auto-reverts. |
+| **Double tap** (within ~350ms) | Flash pairing token on the LCD for 5s, then return to whichever view was active. Equivalent to `curl /show-token`. |
 | Hold 5s, release | Clear all source cells. Equivalent to `curl /forget?all=1`. |
 | Hold **15s** | Factory reset — wipes WiFi creds AND pairing token, reboots into the captive portal. |
 
-While held past 1 second, the LCD shows a progress bar and the next-tier
-action so you can release in time. Releasing between 1-5s aborts.
+Notes:
+
+- The single-tap action fires ~350 ms after release (the firmware waits to see
+  if a second tap is coming). Slight latency, but the trade-off is unambiguous
+  single vs. double detection.
+- Push events from Claude hooks (`/notify`) and from the calendar sidecar
+  (`/todo`) keep updating quietly in the background — the LCD doesn't flip
+  views on you when new data arrives.
+- The view choice lives in RAM only. A reboot returns to the Claude status
+  view; tap once to flip back.
+- While the KEY is held past 1 second, the LCD shows a progress bar and the
+  next-tier action so you can release in time. Releasing between 1-5 s aborts.
 
 ## What the screen shows
 
@@ -121,6 +141,24 @@ action so you can release in time. Releasing between 1-5s aborts.
   attribution, and the `A gift from Diwen Si` inscription. See *Daily quote
   pool* below.
 
+### Calendar view (single-tap KEY)
+
+A full-screen ambient view of today's events, pushed by the sidecar
+(`tools/calendar-push.py`) on a 5-minute timer:
+
+- **Header band:** bold date (e.g. `Sat  Jun 6`) at left; small de-bold
+  `updated Nm ago` right-aligned. The age stamp is for trust — if it reads
+  `updated 47m ago` you know something has the sidecar stuck.
+- **Now divider:** a horizontal row labelled `now  HH:MM` appears between
+  past and upcoming events. Past events sit above it, upcoming below; if
+  everything is done for the day, the divider drops to the bottom.
+- **Event rows:** start time bold (the eye anchors here), end time after a
+  thin dash in a smaller weight, title in regular weight. Up to 8 rows total
+  including the divider; events past row 7 are truncated.
+- **All-day events:** rendered with `all day` in the start column, sorted to
+  the top of the list.
+- **No events today:** the row area shows `no events today`.
+
 ## HTTP API on the ESP32
 
 - `GET /` — plain-text dump of current state, including the device IP.
@@ -135,6 +173,13 @@ action so you can release in time. Releasing between 1-5s aborts.
   - `alert`: optional sub-line below status. Pass empty to clear.
   - `sp`, `r`, `wc`: usage stats shown in the top-right block (last value wins across sources).
 - `GET /forget?t=<token>&src=<label>` / `GET /forget?t=<token>&all=1` — clear source cells.
+- `POST /todo?t=<token>&items=<body>&date=<header>` — replace today's calendar
+  list. `items` is a newline-separated body where each line is three
+  tab-separated fields: `<start>\t<end>\t<title>`. `<start>` may be `HH:MM`,
+  `all day`, or the literal `now` (in which case the row is rendered as a
+  divider and `<title>` holds the current HH:MM). `date` is the header label
+  (e.g. `Sat  Jun 6`). Token-auth required once the device is paired. Used
+  exclusively by `tools/calendar-push.py`; humans don't call this directly.
 - `GET /reset-wifi?t=<token>` — wipe stored WiFi creds and reboot back into
   the `Claude-RLCD-Setup` captive portal. Use when moving the device to a
   new network.
@@ -147,9 +192,9 @@ action so you can release in time. Releasing between 1-5s aborts.
 - `GET /quote-tour` — cycle through every quote in the pool, 5s each
   (~100s total). For visual QA after editing the pool. Unauth; auto-clears.
 
-All write endpoints (`/notify`, `/forget`, `/reset-wifi`, `/unpair`) require
-`?t=<token>` once the device is paired. `/`, `/show-token`, `/quote-tour`,
-and `/pair` (in open mode) stay public.
+All write endpoints (`/notify`, `/forget`, `/todo`, `/reset-wifi`, `/unpair`)
+require `?t=<token>` once the device is paired. `/`, `/show-token`,
+`/quote-tour`, and `/pair` (in open mode) stay public.
 
 ## Daily quote pool
 
@@ -169,6 +214,144 @@ right-aligned, separated from the author attribution.
 To edit the pool or rotation order, see `QUOTES[]` and `QUOTE_ORDER[]` in
 `src/main.cpp`. After any change, rebuild and call `curl
 http://claude-rlcd.local/quote-tour` to cycle every entry visually.
+
+## Connecting a calendar
+
+The calendar view is fed by `tools/calendar-push.py`. It reads ICS URLs from
+`~/.config/claude-rlcd/calendar.conf`, expands today's recurring events,
+formats them, and POSTs the list to the device's `/todo` endpoint. The script
+holds the calendar URLs; the device never sees them, never speaks TLS to the
+outside world.
+
+### Quick setup (via `install.sh`)
+
+`install.sh` walks you through the whole calendar setup at the end of the
+ESP-pairing flow. Just answer `y` when it asks "Connect a calendar now?", paste
+your ICS URL (the prompt lists where to find it per provider), and answer `y`
+again to "Install a 5-minute auto-refresh timer?". The installer:
+
+1. Bootstraps the venv at `tools/.venv` and installs the four Python deps.
+   (On Debian/Ubuntu you may first need `sudo apt install python3-venv`.)
+2. Writes the URL to `~/.config/claude-rlcd/calendar.conf` (mode `0600`).
+3. Runs a live `--push` to confirm the LCD picks it up.
+4. Installs the right kind of refresh timer for your OS:
+   - **systemd-user** unit on regular Linux,
+   - **launchd** agent on macOS,
+   - **cron** entry otherwise (including WSL2 without systemd).
+5. Prints the command for checking the timer's status.
+
+To wire up a second calendar later, add another line to
+`~/.config/claude-rlcd/calendar.conf` and the next timer tick picks it up — no
+re-run needed. To swap providers entirely, re-run `./install.sh` and answer
+through the prompts again.
+
+### Manual setup (skipping `install.sh`)
+
+```bash
+# 1. Bootstrap the venv (once).
+python3 -m venv tools/.venv
+tools/.venv/bin/pip install icalendar recurring_ical_events python-dateutil requests
+
+# 2. Drop the URL in the conf (one per line; '#' for comments).
+mkdir -p ~/.config/claude-rlcd && chmod 700 ~/.config/claude-rlcd
+$EDITOR ~/.config/claude-rlcd/calendar.conf
+chmod 600 ~/.config/claude-rlcd/calendar.conf
+
+# 3. Dry-run (prints what would be sent; does not contact the device).
+tools/.venv/bin/python tools/calendar-push.py
+
+# 4. Push once to confirm the LCD picks it up.
+tools/.venv/bin/python tools/calendar-push.py --push
+```
+
+Then install a timer using one of the snippets under *Scheduling the 5-min
+refresh* below.
+
+### Where to get the ICS URL
+
+Any calendar provider that exposes ICS works — Google, Apple iCloud,
+Microsoft 365 / Outlook.com, Fastmail, Proton, Nextcloud, self-hosted CalDAV
+with publish, Zoho. ICS is a standard, not a Google-specific format.
+
+| Provider | Path to the URL |
+|---|---|
+| **Google Calendar** | Settings → Settings for my calendars → pick calendar → *Integrate calendar* → **Secret address in iCal format** |
+| **Apple iCloud Calendar** | Calendar.app → right-click the calendar → *Share* → *Public Calendar* → copy the `webcal://` URL (the sidecar normalizes the scheme) |
+| **Outlook / Microsoft 365** | Settings → Calendar → *Shared calendars* → *Publish a calendar* → permission must be at least *Limited details* → copy the **ICS** link |
+| **Fastmail / Proton / Nextcloud** | Each calendar has a per-calendar "subscribe link" (ICS) in its settings page |
+| **Local file** | `file:///path/to/today.ics` works too, for testing |
+
+Multiple calendars can coexist in the conf file (one URL per line); the
+sidecar merges them and sorts by start time.
+
+### Caveats per provider
+
+- **Outlook publishing is cached server-side.** New events can take up to ~24
+  hours to appear in the published ICS. Don't conclude the sidecar is broken
+  if a freshly-added event isn't showing — check the raw ICS with `curl
+  <url> | head -50` first.
+- **Outlook publishing may be disabled by your tenant.** Corporate M365
+  admins frequently set `PublishingEnabled = $false`. Workaround: subscribe
+  the work calendar from a personal Google calendar (Calendar → "Other
+  calendars" → "From URL") and publish *that*.
+- **Permission level matters on Outlook.** "Availability only" strips event
+  titles; you need *Limited details* or *Full details* for the LCD to be
+  useful.
+
+### Security
+
+The ICS "secret address" is a long-form bearer credential — anyone holding
+the URL can read every event on that calendar until you rotate the link
+inside the calendar provider's UI. Keep the conf file at mode `0600`
+(default) and avoid pasting the URL into chat logs or commit messages. The
+URL stays on the laptop; never reaches the ESP32 over WiFi.
+
+### Scheduling the 5-min refresh
+
+The sidecar is a one-shot CLI; a system timer drives it on a 5-minute cadence.
+
+**Linux / WSL2 (systemd user timer):**
+
+```ini
+# ~/.config/systemd/user/claude-calendar.service
+[Unit]
+Description=Push today's calendar to the RLCD
+
+[Service]
+Type=oneshot
+ExecStart=%h/path/to/claude-to-RLCD/tools/.venv/bin/python %h/path/to/claude-to-RLCD/tools/calendar-push.py --push
+```
+
+```ini
+# ~/.config/systemd/user/claude-calendar.timer
+[Unit]
+Description=Push today's calendar every 5 min
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user enable --now claude-calendar.timer
+```
+
+**macOS (launchd agent):** create `~/Library/LaunchAgents/sh.diwen.claude-calendar.plist`
+with `StartInterval` = 300 and `ProgramArguments` pointing at the venv python +
+the script, then `launchctl load -w` it.
+
+**Fallback (cron):**
+
+```cron
+*/5 * * * * /path/to/claude-to-RLCD/tools/.venv/bin/python /path/to/claude-to-RLCD/tools/calendar-push.py --push >> /tmp/claude-calendar.log 2>&1
+```
+
+The device shows `updated Nm ago` on the calendar view, so any timer failure
+is visible from across the room.
 
 ## Access control / pairing
 

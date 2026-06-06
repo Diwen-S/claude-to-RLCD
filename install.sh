@@ -174,6 +174,184 @@ with open(settings_path, "w") as f:
 PY
 echo "Merged hooks into $SETTINGS  (backup saved alongside)"
 
+# --- optional: calendar sidecar ----------------------------------------------
+# Wires up the calendar view (single-tap KEY on the device). Opt-in because
+# (a) plenty of users only want the Claude notifier, (b) it touches more of
+# the system (venv, conf file, system timer) than the notifier does.
+
+bootstrap_venv() {
+  local venv="$1"
+  if [ -x "$venv/bin/python" ]; then return 0; fi
+  echo "Creating Python venv at $venv ..."
+  if ! python3 -m venv "$venv" 2>/dev/null; then
+    echo "  python3 -m venv failed (likely missing python3-venv)."
+    case "$(uname -s)" in
+      Linux*)  echo "  Fix: sudo apt install python3-venv  (then re-run ./install.sh)";;
+      Darwin*) echo "  Fix: brew install python   (then re-run ./install.sh)";;
+    esac
+    return 1
+  fi
+  "$venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+  if ! "$venv/bin/pip" install --quiet icalendar recurring_ical_events python-dateutil requests; then
+    echo "  pip install failed — check network, then re-run ./install.sh"
+    return 1
+  fi
+  echo "  installed: icalendar, recurring_ical_events, python-dateutil, requests"
+}
+
+install_timer_systemd() {
+  local push_cmd="$1"
+  local unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/claude-calendar.service" <<EOF
+[Unit]
+Description=Push today's calendar to the Claude RLCD
+
+[Service]
+Type=oneshot
+ExecStart=$push_cmd
+EOF
+  cat > "$unit_dir/claude-calendar.timer" <<EOF
+[Unit]
+Description=Push today's calendar every 5 min
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now claude-calendar.timer >/dev/null
+  echo "  Installed systemd-user timer: claude-calendar.timer"
+  echo "  Check status:  systemctl --user status claude-calendar.timer"
+}
+
+install_timer_launchd() {
+  local push_cmd="$1"
+  local plist="$HOME/Library/LaunchAgents/sh.diwen.claude-calendar.plist"
+  # Split the command into argv (venv-python, script, --push) safely.
+  read -r venv_py script_path flag <<<"$push_cmd"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>sh.diwen.claude-calendar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$venv_py</string>
+    <string>$script_path</string>
+    <string>$flag</string>
+  </array>
+  <key>StartInterval</key>    <integer>300</integer>
+  <key>RunAtLoad</key>        <true/>
+</dict>
+</plist>
+EOF
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load -w "$plist"
+  echo "  Installed launchd agent: sh.diwen.claude-calendar"
+  echo "  Check status:  launchctl list | grep claude-calendar"
+}
+
+install_timer_cron() {
+  local push_cmd="$1"
+  if crontab -l 2>/dev/null | grep -qF "calendar-push.py"; then
+    echo "  cron entry already exists — leaving it in place."
+    return
+  fi
+  local entry="*/5 * * * * $push_cmd >/dev/null 2>&1"
+  (crontab -l 2>/dev/null; echo "$entry") | crontab -
+  echo "  Installed cron entry: $entry"
+  if ! pgrep -x cron >/dev/null 2>&1 && ! pgrep -x crond >/dev/null 2>&1; then
+    echo "  WARNING: no cron daemon running. On WSL2 Ubuntu:  sudo service cron start"
+  fi
+}
+
+install_calendar_timer() {
+  local push_cmd="$1"
+  # Prefer systemd-user when actually present; fall back to launchd on macOS,
+  # then cron everywhere else.
+  if systemctl --user is-system-running >/dev/null 2>&1; then
+    install_timer_systemd "$push_cmd"
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    install_timer_launchd "$push_cmd"
+  else
+    install_timer_cron "$push_cmd"
+  fi
+}
+
+echo
+echo "Calendar view (single-tap KEY on the device) shows today's events from any"
+echo "calendar that exposes an ICS URL — Google, Outlook, iCloud, Fastmail, etc."
+echo "Setting this up is optional."
+printf "Connect a calendar now? [y/N]: "
+read -r want_cal
+case "$want_cal" in
+  [yY]*)
+    VENV="$SCRIPT_DIR/tools/.venv"
+    if bootstrap_venv "$VENV"; then
+      CONF_DIR="$HOME/.config/claude-rlcd"
+      CONF="$CONF_DIR/calendar.conf"
+      mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR"
+
+      have_url=0
+      if [ -f "$CONF" ] && grep -qE '^(https?|webcal|file)://' "$CONF"; then
+        url_count=$(grep -cE '^(https?|webcal|file)://' "$CONF")
+        echo "Found $url_count existing URL(s) in $CONF — keeping them."
+        have_url=1
+      fi
+
+      if [ "$have_url" -eq 0 ]; then
+        cat <<'EOM'
+
+Paste the ICS URL from your calendar provider. Where to find it:
+  Google:   Settings → my calendar → "Secret address in iCal format"
+  Outlook:  Settings → Calendar → Shared calendars → Publish a calendar
+            (permission must be "Limited details" or higher)
+  iCloud:   right-click calendar → Share → Public Calendar  (webcal://)
+  Fastmail / Proton / Nextcloud: per-calendar "subscribe" link
+EOM
+        printf "ICS URL (or Enter to skip): "
+        read -r ics_url
+        ics_url=$(printf '%s' "$ics_url" | tr -d ' \n\r')
+        if [ -n "$ics_url" ]; then
+          if [ ! -f "$CONF" ]; then
+            printf '# One ICS URL per line. Lines starting with # are ignored.\n' > "$CONF"
+          fi
+          printf '%s\n' "$ics_url" >> "$CONF"
+          chmod 600 "$CONF"
+          echo "  Wrote $CONF"
+          have_url=1
+        else
+          echo "  Skipped — calendar view will show 'no sidecar push yet' until you add one."
+        fi
+      fi
+
+      if [ "$have_url" -eq 1 ]; then
+        echo "Validating against the device ..."
+        if "$VENV/bin/python" "$SCRIPT_DIR/tools/calendar-push.py" --push 2>&1 | sed 's/^/  /'; then
+          printf "Install a 5-minute auto-refresh timer? [y/N]: "
+          read -r want_timer
+          case "$want_timer" in
+            [yY]*) install_calendar_timer "$VENV/bin/python $SCRIPT_DIR/tools/calendar-push.py --push" ;;
+            *)     echo "  Skipped. Manual refresh:  $VENV/bin/python $SCRIPT_DIR/tools/calendar-push.py --push" ;;
+          esac
+        else
+          echo "  Push failed. Inspect the URL in $CONF and re-run ./install.sh"
+        fi
+      fi
+    fi
+    ;;
+  *)
+    echo "Skipped — single-tap KEY will show 'no sidecar push yet'."
+    ;;
+esac
+
 # --- done ---------------------------------------------------------------------
 cat <<EOF
 
