@@ -7,9 +7,11 @@ rows for the device's /todo endpoint, and inserts a "now" divider at the
 boundary between past and upcoming events.
 
 Network I/O uses only the Python stdlib (urllib.request) — no `requests`
-dependency. The three non-stdlib imports (icalendar, recurring_ical_events,
-dateutil) are pure Python and bundled as wheels under tools/vendor/ so that
-install.sh can bootstrap the venv offline.
+dependency. The non-stdlib imports (icalendar, recurring_ical_events,
+dateutil, certifi) are pure Python and bundled as wheels under tools/vendor/
+so that install.sh can bootstrap the venv offline. certifi backs HTTPS cert
+verification on macOS, where python.org builds ship an empty trust store
+(see _ssl_context below); it is optional everywhere else.
 
 Modes (see --help):
     no flag   dry-run; prints what would be sent to stdout. Used for setup
@@ -26,6 +28,7 @@ Exit codes:
 import argparse
 import os
 import pathlib
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -73,6 +76,25 @@ def normalize_url(url):
     return url
 
 
+def _ssl_context():
+    # System trust store first, then certifi's Mozilla bundle on top. macOS
+    # python.org / pyenv builds don't read the Keychain, so the default
+    # context there has zero root CAs and every https fetch dies with
+    # CERTIFICATE_VERIFY_FAILED; certifi fills that hole. The union (rather
+    # than certifi alone) keeps corporate / self-signed CAs in the system
+    # store working on Linux and WSL.
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass  # certifi missing (old venv) — system store alone
+    return ctx
+
+
+SSL_CTX = _ssl_context()
+
+
 def load_calendar(url):
     if url.startswith("file://"):
         body = pathlib.Path(url[7:]).read_bytes()
@@ -80,7 +102,7 @@ def load_calendar(url):
         # Some servers (e.g. Microsoft 365) reject the default Python User-Agent
         # with 403; pretend to be a generic client to dodge that.
         req = urllib.request.Request(url, headers={"User-Agent": "claude-rlcd/1.0"})
-        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT, context=SSL_CTX) as r:
             body = r.read()
     return icalendar.Calendar.from_ical(body)
 

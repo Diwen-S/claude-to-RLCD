@@ -16,7 +16,7 @@ echo "Wiping old wheels in $SCRIPT_DIR ..."
 rm -f "$SCRIPT_DIR"/*.whl
 
 echo "Downloading current versions from PyPI ..."
-"$VENV/bin/pip" download --dest "$SCRIPT_DIR" icalendar recurring_ical_events python-dateutil
+"$VENV/bin/pip" download --dest "$SCRIPT_DIR" icalendar recurring_ical_events python-dateutil certifi
 
 echo
 echo "Done. New contents:"

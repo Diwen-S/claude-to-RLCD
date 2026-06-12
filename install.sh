@@ -182,7 +182,16 @@ echo "Merged hooks into $SETTINGS  (backup saved alongside)"
 bootstrap_venv() {
   local venv="$1"
   local vendor="$SCRIPT_DIR/tools/vendor"
-  if [ -x "$venv/bin/python" ]; then return 0; fi
+  if [ -x "$venv/bin/python" ]; then
+    # Venvs created before the macOS CA fix lack certifi — backfill so a
+    # plain `git pull && ./install.sh` repairs CERTIFICATE_VERIFY_FAILED.
+    if ! "$venv/bin/python" -c "import certifi" 2>/dev/null; then
+      "$venv/bin/pip" install --quiet --no-index --find-links "$vendor" certifi 2>/dev/null \
+        || "$venv/bin/pip" install --quiet certifi 2>/dev/null \
+        || echo "  warning: could not install certifi into existing venv (https fetches may fail on macOS)"
+    fi
+    return 0
+  fi
   # Wall-clock varies wildly with filesystem: ~5-10 s on native Linux/macOS,
   # but up to ~60 s on WSL when the repo lives on /mnt/c or /mnt/d (per-file
   # NTFS-via-9P overhead). The PyPI fallback adds another 5-30 s on top.
@@ -203,7 +212,7 @@ bootstrap_venv() {
   # handles --find-links fine, and skipping it keeps the offline path offline.
   if [ -d "$vendor" ] && ls "$vendor"/*.whl >/dev/null 2>&1; then
     if "$venv/bin/pip" install --quiet --no-index --find-links "$vendor" \
-         icalendar recurring_ical_events python-dateutil 2>/dev/null; then
+         icalendar recurring_ical_events python-dateutil certifi 2>/dev/null; then
       echo "  installed from bundled wheels in $vendor (offline)"
       return 0
     fi
@@ -211,8 +220,8 @@ bootstrap_venv() {
   fi
   # PyPI path: upgrade pip first since we're about to hit the network anyway.
   "$venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
-  if "$venv/bin/pip" install --quiet icalendar recurring_ical_events python-dateutil; then
-    echo "  installed from PyPI: icalendar, recurring_ical_events, python-dateutil"
+  if "$venv/bin/pip" install --quiet icalendar recurring_ical_events python-dateutil certifi; then
+    echo "  installed from PyPI: icalendar, recurring_ical_events, python-dateutil, certifi"
     return 0
   fi
   echo "  pip install failed — no network and bundled wheels missing / incompatible."
@@ -327,7 +336,17 @@ case "$want_cal" in
         have_url=1
       fi
 
-      if [ "$have_url" -eq 0 ]; then
+      # Collect as many ICS URLs as the user wants; events from all of them
+      # get merged into one list. With pre-existing URLs we only offer to add
+      # more; on a fresh conf we go straight to the first URL prompt.
+      adding=1
+      if [ "$have_url" -eq 1 ]; then
+        printf "Add another calendar? [y/N]: "
+        read -r more
+        case "$more" in [yY]*) ;; *) adding=0 ;; esac
+      fi
+
+      if [ "$adding" -eq 1 ]; then
         cat <<'EOM'
 
 Paste the ICS URL from your calendar provider. Where to find it:
@@ -337,6 +356,9 @@ Paste the ICS URL from your calendar provider. Where to find it:
   iCloud:   right-click calendar → Share → Public Calendar  (webcal://)
   Fastmail / Proton / Nextcloud: per-calendar "subscribe" link
 EOM
+      fi
+
+      while [ "$adding" -eq 1 ]; do
         printf "ICS URL (or Enter to skip): "
         read -r ics_url
         ics_url=$(printf '%s' "$ics_url" | tr -d ' \n\r')
@@ -348,9 +370,14 @@ EOM
           chmod 600 "$CONF"
           echo "  Wrote $CONF"
           have_url=1
-        else
-          echo "  Skipped — calendar view will show 'no sidecar push yet' until you add one."
         fi
+        printf "Add another calendar? [y/N]: "
+        read -r more
+        case "$more" in [yY]*) ;; *) adding=0 ;; esac
+      done
+
+      if [ "$have_url" -eq 0 ]; then
+        echo "  Skipped — calendar view will show 'no sidecar push yet' until you add one."
       fi
 
       if [ "$have_url" -eq 1 ]; then

@@ -233,9 +233,11 @@ networks or during gift-unboxing without internet.
 ### Quick setup (via `install.sh`)
 
 `install.sh` walks you through the whole calendar setup at the end of the
-ESP-pairing flow. Just answer `y` when it asks "Connect a calendar now?", paste
-your ICS URL (the prompt lists where to find it per provider), and answer `y`
-again to "Install a 5-minute auto-refresh timer?". The installer:
+ESP-pairing flow. Answer `y` when it asks "Connect a calendar now?", paste an
+ICS URL (the prompt lists where to find it per provider), and keep answering
+`y` to "Add another calendar?" until you've added all of them — events from
+every listed calendar get merged into one view. Then answer `y` to "Install a
+5-minute auto-refresh timer?". The installer:
 
 1. Bootstraps the venv at `tools/.venv` and installs the three Python deps,
    **offline if possible** — `install.sh` first tries the bundled wheels in
@@ -243,7 +245,7 @@ again to "Install a 5-minute auto-refresh timer?". The installer:
    or stale. So the calendar works even on machines without internet at
    install time (corporate proxies, university firewalls, gift unboxing).
    On Debian/Ubuntu you may first need `sudo apt install python3-venv`.
-2. Writes the URL to `~/.config/claude-rlcd/calendar.conf` (mode `0600`).
+2. Writes the URLs to `~/.config/claude-rlcd/calendar.conf` (mode `0600`).
 3. Runs a live `--push` to confirm the LCD picks it up.
 4. Installs the right kind of refresh timer for your OS:
    - **systemd-user** unit on regular Linux,
@@ -251,10 +253,11 @@ again to "Install a 5-minute auto-refresh timer?". The installer:
    - **cron** entry otherwise (including WSL2 without systemd).
 5. Prints the command for checking the timer's status.
 
-To wire up a second calendar later, add another line to
-`~/.config/claude-rlcd/calendar.conf` and the next timer tick picks it up — no
-re-run needed. To swap providers entirely, re-run `./install.sh` and answer
-through the prompts again.
+To wire up another calendar later, either re-run `./install.sh` (it keeps the
+existing URLs and asks "Add another calendar?") or just add a line to
+`~/.config/claude-rlcd/calendar.conf` by hand — the next timer tick picks it
+up either way. To swap providers entirely, edit the conf and remove the old
+line.
 
 ### Manual setup (skipping `install.sh`)
 
@@ -262,7 +265,7 @@ through the prompts again.
 # 1. Bootstrap the venv (once). Offline install from the bundled wheels:
 python3 -m venv tools/.venv
 tools/.venv/bin/pip install --no-index --find-links tools/vendor/ \
-    icalendar recurring_ical_events python-dateutil
+    icalendar recurring_ical_events python-dateutil certifi
 # (Drop --no-index --find-links to pull current versions from PyPI instead.)
 
 # 2. Drop the URL in the conf (one per line; '#' for comments).
@@ -426,6 +429,24 @@ determined attacker on the same network.
 ---
 
 ## Troubleshooting
+
+### Calendar fetch fails on macOS with CERTIFICATE_VERIFY_FAILED
+
+`certificate verify failed: unable to get local issuer certificate` from
+`calendar-push.py` means the Python you're running doesn't trust any root CAs.
+python.org and pyenv builds of CPython on macOS ship their own OpenSSL and do
+**not** read the system Keychain, so their trust store starts empty. Current
+versions of this repo handle it automatically (`certifi` is bundled in
+`tools/vendor/` and loaded on top of the system store); if you're seeing the
+error on an older clone, `git pull` and re-run `./install.sh`, or patch the
+existing venv directly:
+
+```bash
+tools/.venv/bin/pip install certifi
+```
+
+Linux/WSL (system `/etc/ssl/certs`) and Windows (system cert store) are
+unaffected either way.
 
 ### Re-flashing the firmware
 
