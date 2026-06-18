@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the Claude Code -> ESP32 RLCD notifier hooks on this machine.
+# Install the ESP32 RLCD notifier hooks for Claude Code and/or Codex.
 # Usage:  ./install.sh [host-or-ip]
 # Runs on WSL, macOS, and Linux.
 set -e
@@ -67,12 +67,8 @@ fi
 
 echo "Reached ESP at: $HOST"
 
-# --- copy hook script ---------------------------------------------------------
+# --- common: device IP file (both agents read this) ---------------------------
 mkdir -p "$CLAUDE_DIR"
-cp "$SCRIPT_DIR/notify-esp32.sh" "$CLAUDE_DIR/notify-esp32.sh"
-chmod +x "$CLAUDE_DIR/notify-esp32.sh"
-echo "Installed $CLAUDE_DIR/notify-esp32.sh"
-
 printf '%s\n' "$HOST" > "$CLAUDE_DIR/esp32-ip"
 echo "Wrote $CLAUDE_DIR/esp32-ip ($HOST)"
 
@@ -131,9 +127,13 @@ else
   fi
 fi
 
-# --- merge hooks into settings.json ------------------------------------------
-SNIPPET="$SCRIPT_DIR/settings-snippet.json"
-SETTINGS="$CLAUDE_DIR/settings.json"
+# --- agent wiring (opt-in, sequential) ---------------------------------------
+install_claude() {
+  cp "$SCRIPT_DIR/notify-esp32.sh" "$CLAUDE_DIR/notify-esp32.sh"
+  chmod +x "$CLAUDE_DIR/notify-esp32.sh"
+  echo "  Installed $CLAUDE_DIR/notify-esp32.sh"
+  local SNIPPET="$SCRIPT_DIR/settings-snippet.json"
+  local SETTINGS="$CLAUDE_DIR/settings.json"
 
 if [ ! -f "$SETTINGS" ]; then
   echo "{}" > "$SETTINGS"
@@ -172,7 +172,114 @@ with open(settings_path, "w") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
 PY
-echo "Merged hooks into $SETTINGS  (backup saved alongside)"
+echo "  Merged hooks into $SETTINGS  (backup saved alongside)"
+}
+
+install_codex() {
+  cp "$SCRIPT_DIR/notify-esp32-codex.sh" "$CLAUDE_DIR/notify-esp32-codex.sh"
+  chmod +x "$CLAUDE_DIR/notify-esp32-codex.sh"
+  echo "  Installed $CLAUDE_DIR/notify-esp32-codex.sh"
+  local script="$CLAUDE_DIR/notify-esp32-codex.sh"
+
+  # Locate the Codex home (config.toml lives here).
+  local cdir=""
+  if [ -n "$CODEX_HOME" ] && [ -d "$CODEX_HOME" ]; then
+    cdir="$CODEX_HOME"
+  elif [ -d "$HOME/.codex" ]; then
+    cdir="$HOME/.codex"
+  elif grep -qi microsoft /proc/version 2>/dev/null; then
+    # WSL with Codex installed on the Windows side.
+    local d
+    for d in /mnt/c/Users/*/.codex; do
+      if [ -f "$d/config.toml" ]; then cdir="$d"; break; fi
+    done
+  fi
+  if [ -z "$cdir" ]; then
+    printf "  Could not find a Codex home. Enter path to your .codex dir (Enter to skip): "
+    read -r cdir
+    cdir=$(printf '%s' "$cdir" | tr -d ' \n\r')
+    [ -z "$cdir" ] && { echo "  Skipped Codex."; return; }
+  fi
+  [ -d "$cdir" ] || { echo "  $cdir is not a directory — skipping Codex."; return; }
+  local conf="$cdir/config.toml"
+  [ -f "$conf" ] || : > "$conf"
+
+  # Codex runs the hook on its own OS. If its home is a Windows mount, Codex is
+  # the Windows build and reaches the WSL script via wsl.exe; otherwise it calls
+  # the script directly.
+  local run="$script"
+  case "$cdir" in
+    /mnt/[a-z]/*) run="wsl.exe -e $script" ;;
+  esac
+
+  cp "$conf" "$conf.bak.$(date +%Y%m%d-%H%M%S)"
+
+  # Marker-delimited block so re-running install.sh replaces, not duplicates.
+  local block
+  block=$(cat <<EOF
+# >>> claude-rlcd codex hooks (managed by install.sh) >>>
+[[hooks.UserPromptSubmit]]
+matcher = ""
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = '$run working'
+
+[[hooks.Stop]]
+matcher = ""
+[[hooks.Stop.hooks]]
+type = "command"
+command = '$run done'
+
+[[hooks.PermissionRequest]]
+matcher = ""
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = '$run action'
+
+[[hooks.PreToolUse]]
+matcher = ""
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '$run clear'
+# <<< claude-rlcd codex hooks <<<
+EOF
+)
+
+  CONF="$conf" BLOCK="$block" python3 - <<'PY'
+import os, re
+conf = os.environ["CONF"]; block = os.environ["BLOCK"]
+try:
+    with open(conf) as f: text = f.read()
+except Exception:
+    text = ""
+# Strip any prior managed block, then append the fresh one at EOF.
+text = re.sub(
+    r"\n*# >>> claude-rlcd codex hooks.*?# <<< claude-rlcd codex hooks <<<\n?",
+    "\n", text, flags=re.S)
+text = text.rstrip("\n")
+text = (text + "\n\n" if text else "") + block + "\n"
+with open(conf, "w") as f:
+    f.write(text)
+PY
+  echo "  Wrote Codex hooks into $conf  (backup saved alongside)"
+  echo "  NOTE: Codex trust-gates hooks — approve them on your first 'codex' run."
+}
+
+echo
+printf "Set up Claude Code? [Y/n]: "
+read -r want_claude
+case "$want_claude" in
+  [nN]*) echo "  Skipped Claude Code." ;;
+  *)     install_claude ;;
+esac
+
+echo
+printf "Set up Codex? [y/N]: "
+read -r want_codex
+case "$want_codex" in
+  [yY]*) install_codex ;;
+  *)     echo "  Skipped Codex." ;;
+esac
 
 # --- optional: calendar sidecar ----------------------------------------------
 # Wires up the calendar view (single-tap KEY on the device). Opt-in because
@@ -404,18 +511,20 @@ esac
 cat <<EOF
 
 Installed.
-  Device:     http://$HOST/
-  Hook script: $CLAUDE_DIR/notify-esp32.sh
-  Settings:    $SETTINGS
+  Device:      http://$HOST/
+  Claude hook: $CLAUDE_DIR/notify-esp32.sh        (if you enabled Claude Code)
+  Codex hook:  $CLAUDE_DIR/notify-esp32-codex.sh  (if you enabled Codex)
 
 Test the link to the device:
   curl http://$HOST/
 
-Then start a new Claude Code session — the screen will switch to WORKING on
-your first prompt and DONE when Claude finishes.
+Start a new Claude Code and/or Codex session — the screen switches to WORKING
+on your first prompt and DONE when the agent finishes. Codex will ask you to
+trust its hooks the first time.
 
 Optional (the t= query arg is your pairing token; required once paired):
-  echo "MyLabel" > ~/.claude/session-label                       # rename session
+  echo "MyLabel" > ~/.claude/session-label                       # rename Claude session
+  echo "MyLabel" > ~/.claude/session-label-codex                 # rename Codex session
   curl "http://$HOST/forget?t=\$(cat ~/.claude/esp32-token)&all=1"   # wipe sources
   curl "http://$HOST/reset-wifi?t=\$(cat ~/.claude/esp32-token)"     # re-portal
   curl "http://$HOST/show-token"                                  # flash token on LCD

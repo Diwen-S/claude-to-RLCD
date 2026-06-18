@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove the Claude Code -> ESP32 RLCD notifier from THIS machine.
+# Remove the Claude Code and Codex -> ESP32 RLCD notifiers from THIS machine.
 # Leaves the device itself alone (other paired machines keep working).
 # Also tears down the calendar sidecar's auto-refresh timer (systemd-user
 # unit / launchd agent / cron entry) if install.sh set one up. The calendar
@@ -21,7 +21,7 @@ CAL_CONF_DIR="$HOME/.config/claude-rlcd"
 
 # --- remove the local files we put down --------------------------------------
 removed=()
-for f in notify-esp32.sh esp32-ip esp32-token; do
+for f in notify-esp32.sh notify-esp32-codex.sh esp32-ip esp32-token; do
   if [ -e "$CLAUDE_DIR/$f" ]; then
     rm -f "$CLAUDE_DIR/$f"
     removed+=("$CLAUDE_DIR/$f")
@@ -106,6 +106,33 @@ PY
 )
 fi
 
+# --- strip our Codex hook block from config.toml -----------------------------
+# Mirrors install.sh's Codex-home discovery; removes only the marked block.
+codex_stripped=0
+codex_conf=""
+if [ -n "$CODEX_HOME" ] && [ -f "$CODEX_HOME/config.toml" ]; then
+  codex_conf="$CODEX_HOME/config.toml"
+elif [ -f "$HOME/.codex/config.toml" ]; then
+  codex_conf="$HOME/.codex/config.toml"
+elif grep -qi microsoft /proc/version 2>/dev/null; then
+  for d in /mnt/c/Users/*/.codex; do
+    if [ -f "$d/config.toml" ]; then codex_conf="$d/config.toml"; break; fi
+  done
+fi
+if [ -n "$codex_conf" ] && grep -q '# >>> claude-rlcd codex hooks' "$codex_conf" 2>/dev/null; then
+  cp "$codex_conf" "$codex_conf.bak.$(date +%Y%m%d-%H%M%S)"
+  CONF="$codex_conf" python3 - <<'PY'
+import os, re
+p = os.environ["CONF"]
+text = open(p).read()
+text = re.sub(
+    r"\n*# >>> claude-rlcd codex hooks.*?# <<< claude-rlcd codex hooks <<<\n?",
+    "\n", text, flags=re.S)
+open(p, "w").write(text.rstrip("\n") + "\n")
+PY
+  codex_stripped=1
+fi
+
 # --- report ------------------------------------------------------------------
 echo "Uninstalled."
 if [ ${#removed[@]} -gt 0 ]; then
@@ -114,6 +141,9 @@ else
   echo "  no local files to remove (already clean)"
 fi
 echo "  stripped $hooks_stripped notify-esp32.sh hook entr$([ "$hooks_stripped" = "1" ] && echo "y" || echo "ies") from $SETTINGS"
+if [ "$codex_stripped" = "1" ]; then
+  echo "  stripped Codex hook block from $codex_conf  (backup saved alongside)"
+fi
 if [ -n "$cal_timer_removed" ]; then
   echo "  removed calendar timer ($cal_timer_removed)"
 fi
