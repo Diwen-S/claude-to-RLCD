@@ -1,0 +1,10 @@
+# Normalize line endings: store and check out text as LF on every platform.
+# Stops Windows-side tools from silently rewriting files to CRLF (which shows
+# up as spurious "whole-file changed" diffs, and breaks bash on .sh scripts).
+* text=auto eol=lf
+
+# Shell scripts must stay LF — bash chokes on a stray CR (\r).
+*.sh text eol=lf
+
+# Archives / binaries: never touch.
+*.whl binary
