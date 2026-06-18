@@ -6,6 +6,9 @@ A 4.2" 400×300 reflective LCD that lights up with `WORKING` / `DONE` /
 
 Wired to Claude Code via Stop / UserPromptSubmit / Notification / PreToolUse
 hooks. Supports multiple parallel Claude Code sessions with distinct labels.
+**Codex** (OpenAI's CLI) is supported too, through its own lifecycle hooks; it
+gets its own `(Codex)` cells alongside the `(Code)` ones. See *Codex support*
+below.
 
 Single-tap the on-board KEY button to flip the screen into an ambient
 **calendar view** of today's events — date header, start + end times, a "now"
@@ -30,13 +33,15 @@ The firmware is already on the board. To set it up on a new WiFi:
    ```
    It discovers the ESP at `http://claude-rlcd.local/` (or asks for the IP if
    mDNS isn't available — common on WSL2), prompts you for the pairing token
-   the gifter wrote on the sticker (e.g. `20030102`), copies the hook script
-   to `~/.claude/`, and merges the hooks into `~/.claude/settings.json`
-   without touching your other settings. If the gifter forgot the sticker,
-   run `curl http://claude-rlcd.local/show-token` and read the token off the
-   LCD.
-5. **Start a new Claude Code session.** The screen flips to `WORKING` on your
-   first prompt and `DONE` when Claude finishes.
+   the gifter wrote on the sticker (e.g. `20030102`), then asks two yes/no
+   questions: **"Set up Claude Code?"** and **"Set up Codex?"**. Answer each
+   to wire that agent (you can pick one, both, or neither). For Claude it
+   copies the hook script to `~/.claude/` and merges hooks into
+   `~/.claude/settings.json` without touching your other settings; for Codex
+   see *Codex support* below. If the gifter forgot the sticker, run `curl
+   http://claude-rlcd.local/show-token` and read the token off the LCD.
+5. **Start a new Claude Code (or Codex) session.** The screen flips to
+   `WORKING` on your first prompt and `DONE` when the agent finishes.
 
 That's it. The rest of this README is reference and troubleshooting.
 
@@ -55,8 +60,9 @@ claude-to-RLCD/
 ├── src/
 │   ├── main.cpp                 firmware
 │   └── ST7305_U8g2.cpp/.h       Waveshare ST7305 driver wrapper (vendored)
-├── notify-esp32.sh              hook script — installed to ~/.claude/
-├── settings-snippet.json        hook config — merged into ~/.claude/settings.json
+├── notify-esp32.sh              Claude hook script — installed to ~/.claude/
+├── notify-esp32-codex.sh        Codex hook script — installed to ~/.claude/
+├── settings-snippet.json        Claude hook config — merged into ~/.claude/settings.json
 ├── install.sh                   one-shot installer for each driving machine
 ├── uninstall.sh                 reverse of install.sh on a single machine
 └── tools/
@@ -101,6 +107,67 @@ session evicts them, or until you clear manually with (where
 curl "http://claude-rlcd.local/forget?t=$T&src=Foo%20(Code)"
 curl "http://claude-rlcd.local/forget?t=$T&all=1"
 ```
+
+## Codex support
+
+Codex (OpenAI's CLI) drives the same device through its own lifecycle hooks.
+Nothing changes on the firmware: `/notify` is provider-agnostic, so a Codex
+session simply claims its own cell, labelled `(Codex)`, next to any `(Code)`
+cells. The event mapping mirrors the Claude one:
+
+| Codex hook | Device state |
+|---|---|
+| `UserPromptSubmit` | `WORKING` |
+| `Stop` | `DONE` |
+| `PermissionRequest` | `Action required` flash |
+| `PreToolUse` | clears the alert |
+
+`install.sh` wires this when you answer `y` to "Set up Codex?". It:
+
+1. Copies `notify-esp32-codex.sh` to `~/.claude/`.
+2. Locates the Codex home (`$CODEX_HOME`, else `~/.codex`, else on WSL the
+   Windows-side `/mnt/c/Users/*/.codex`).
+3. Writes the four hook blocks into that `config.toml`, inside a
+   `# >>> claude-rlcd codex hooks >>>` ... `<<<` marker block so re-running the
+   installer replaces rather than duplicates them. The existing `config.toml`
+   is backed up alongside first.
+
+If Codex lives on a Windows mount while you install from WSL (the common WSL
+case), the hook command is generated as `wsl.exe -e ~/.claude/notify-esp32-codex.sh <mode>`
+so the Windows Codex build reaches the WSL-resident script; on a native
+Linux/macOS Codex it calls the script directly.
+
+**Codex session labels** work like the Claude ones but read from their own
+sources, in priority order:
+
+1. `~/.claude/session-label-codex` (file, edit anytime)
+2. `$CODEX_SESSION_LABEL` (env var, set before launching `codex`)
+3. the `cwd` field from the hook's JSON payload (so each project folder gets
+   its own cell; `$PWD` is not used, since a WSL-bridged hook would see the
+   WSL landing dir rather than the Codex project)
+4. hostname
+
+The 4-char suffix comes from the hook payload's `session_id`. Codex cells
+carry no usage stats: `ccusage` reports Claude usage, which would be
+misleading under a `(Codex)` label, so `sp` / `r` / `wc` are left blank.
+
+**Caveats:**
+
+- **Trust gating.** Codex will not run a hook until you trust it (it records a
+  hash). Approve the hooks on your first interactive `codex` session, or run
+  once with `--dangerously-bypass-hook-trust` (skips the safety check; prefer
+  the prompt).
+- **No auto-forget.** Codex has no documented session-end event, so unlike the
+  Claude `SessionEnd` -> `/forget` path, a `(Codex)` cell lingers until it is
+  overwritten or evicted by a 5th source. Clear it manually with
+  `curl "http://claude-rlcd.local/forget?t=$T&src=<label>%20(Codex)"`.
+- **Alpha surface.** Codex hooks are recent (verified on `codex-cli`
+  0.142.0-alpha.1) and the schema may shift. If a hook stops firing after a
+  Codex update, run `codex doctor` to confirm `config.toml parse ok` and that
+  the block is still valid.
+- **Teardown.** `uninstall.sh` removes the Codex pieces too: it deletes
+  `~/.claude/notify-esp32-codex.sh` and strips the marked block from the Codex
+  `config.toml` (backing it up first), alongside the Claude cleanup.
 
 ## Physical KEY button
 
@@ -408,10 +475,11 @@ paired machines working):
 ./uninstall.sh                    # keep tools/.venv and calendar.conf
 ./uninstall.sh --purge-calendar   # also wipe tools/.venv and ~/.config/claude-rlcd/
 ```
-Removes `~/.claude/{notify-esp32.sh,esp32-ip,esp32-token}`, strips the
-notify hooks from `~/.claude/settings.json`, and tears down the calendar
-auto-refresh timer (systemd-user / launchd / cron) if `install.sh` set one
-up. Every other setting in `settings.json` is preserved.
+Removes `~/.claude/{notify-esp32.sh,notify-esp32-codex.sh,esp32-ip,esp32-token}`,
+strips the notify hooks from `~/.claude/settings.json` and the marked Codex
+block from the Codex `config.toml`, and tears down the calendar auto-refresh
+timer (systemd-user / launchd / cron) if `install.sh` set one up. Every other
+setting in `settings.json` is preserved.
 
 **Then deleting the cloned repo folder:** if you're on WSL/Linux/macOS, plain
 `rm -rf` works. If you're deleting from **Windows Explorer**, run
@@ -493,6 +561,45 @@ token returns 403 and nothing reaches the screen.
 
 Dependencies: `node` (for `npx`), `python3`, `curl`. `notify-esp32.sh` invokes
 `npx ccusage` to fetch the current 5-hour window and weekly spend.
+
+For **Codex**, copy the script and add the hooks to the Codex `config.toml`
+(`~/.codex/`, or the Windows-side `.codex` if Codex runs on Windows):
+
+```bash
+cp notify-esp32-codex.sh ~/.claude/notify-esp32-codex.sh
+chmod +x ~/.claude/notify-esp32-codex.sh
+```
+
+```toml
+# in config.toml. Drop the "wsl.exe -e " prefix if Codex runs on the same OS
+# as the script (native Linux/macOS rather than Windows-over-WSL).
+[[hooks.UserPromptSubmit]]
+matcher = ""
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh working'
+
+[[hooks.Stop]]
+matcher = ""
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh done'
+
+[[hooks.PermissionRequest]]
+matcher = ""
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh action'
+
+[[hooks.PreToolUse]]
+matcher = ""
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh clear'
+```
+
+`notify-esp32-codex.sh` needs only `python3` and `curl` (no `ccusage`). It
+reads the same `~/.claude/esp32-ip` and `~/.claude/esp32-token` files.
 
 ### Other gotchas
 
