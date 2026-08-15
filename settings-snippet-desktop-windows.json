@@ -1,0 +1,81 @@
+{
+  "_comment": [
+    "Claude Code DESKTOP app on Windows. Merge the 'hooks' key below into",
+    "C:\\Users\\<you>\\.claude\\settings.json (your Windows profile, NOT your WSL home),",
+    "then replace <you> with your WSL username and restart the app completely.",
+    "",
+    "The paths are Linux paths inside WSL. Do not convert them to Windows paths.",
+    "",
+    "MSYS_NO_PATHCONV=1 is REQUIRED. The desktop app runs hooks through Git Bash,",
+    "whose MSYS2 layer rewrites absolute POSIX arguments: without the prefix,",
+    "/home/<you>/... arrives at wsl.exe as C:/Program Files/Git/home/<you>/... and",
+    "fails with 'execvpe ... No such file or directory'.",
+    "",
+    "Do NOT wrap these in 'cmd.exe /c'. Under Git Bash that spawns an interactive",
+    "cmd which eats the JSON payload from stdin and exits 0, so the hook reports",
+    "success while the device is never contacted.",
+    "",
+    "The trailing 'win' argument tags the cell (Code W), suppresses ccusage stats",
+    "(they would report WSL CLI usage, not desktop usage), and makes the script run",
+    "synchronously, which a wsl.exe-bridged hook requires.",
+    "",
+    "For the WSL/Linux/macOS CLI instead, use settings-snippet.json."
+  ],
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh working win"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh done win"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh action win"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh clear win"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh closed win"
+          }
+        ]
+      }
+    ]
+  }
+}

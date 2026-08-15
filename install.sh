@@ -22,8 +22,15 @@ if [ ${#missing[@]} -gt 0 ]; then
   exit 1
 fi
 
+# Every device call needs a generous cap. Two costs stack: mDNS resolution from
+# WSL2 measured 1.2-1.6s on its own, and the ST7305 repaints synchronously
+# before the handler answers. /pair is the worst case — it paints the token
+# banner, sleeps 2.5s, then repaints — and was measured at 5.24s end to end,
+# which the previous -m 5 lost a coin flip to on the recipient's first install.
+DEV_TIMEOUT=20
+
 probe() {
-  curl -sf -m 4 "http://$1/" -o /dev/null
+  curl -sf -m "$DEV_TIMEOUT" "http://$1/" -o /dev/null
 }
 
 # --- discovery ----------------------------------------------------------------
@@ -68,16 +75,51 @@ fi
 echo "Reached ESP at: $HOST"
 
 # --- common: device IP file (both agents read this) ---------------------------
+# Store a literal IP, never the mDNS name, even though mDNS is what we probed
+# with. Hooks fire on every prompt and every tool call, and mDNS resolution
+# from WSL2 measured 1.2-1.6s *per call* — which both dwarfs the device's own
+# ~0.17s response and is the reason hooks intermittently dropped updates and
+# left stale cells (curl rc=6 when the name fails to resolve). Codex compounds
+# it: it caps hooks at timeoutSec=1, so an mDNS-resolved call cannot finish
+# inside the budget at all.
+#
+# The device reports its own address in the status dump, which is more reliable
+# than resolving locally (no avahi needed in WSL). Fall back to whatever we
+# probed with if that lookup fails, so this can only improve on the old
+# behaviour. The notifier scripts retry against the mDNS name and re-cache if
+# the stored IP ever stops answering, so a DHCP lease change self-heals.
 mkdir -p "$CLAUDE_DIR"
-printf '%s\n' "$HOST" > "$CLAUDE_DIR/esp32-ip"
-echo "Wrote $CLAUDE_DIR/esp32-ip ($HOST)"
+# Retry: the ESP serves one request at a time, so a hook firing from an active
+# session elsewhere on the LAN can make a single attempt fail on a reset
+# connection. Observed in testing — one attempt is a coin flip when anything
+# else is talking to the board.
+DEVICE_IP=""
+for _attempt in 1 2 3; do
+  DEVICE_IP=$(curl -s -m "$DEV_TIMEOUT" "http://$HOST/" | awk '/^ip[[:space:]]*=/ {print $3; exit}')
+  printf '%s' "$DEVICE_IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' && break
+  DEVICE_IP=""
+  sleep 1
+done
+if [ -n "$DEVICE_IP" ] && probe "$DEVICE_IP"; then
+  printf '%s\n' "$DEVICE_IP" > "$CLAUDE_DIR/esp32-ip"
+  if [ "$DEVICE_IP" = "$HOST" ]; then
+    echo "Wrote $CLAUDE_DIR/esp32-ip ($DEVICE_IP)"
+  else
+    echo "Wrote $CLAUDE_DIR/esp32-ip ($DEVICE_IP, resolved from $HOST — avoids per-hook mDNS)"
+  fi
+else
+  printf '%s\n' "$HOST" > "$CLAUDE_DIR/esp32-ip"
+  echo "Wrote $CLAUDE_DIR/esp32-ip ($HOST)"
+  echo "  note: could not read a literal IP from the device; hooks will resolve"
+  echo "        $HOST on every call, which is slower and can drop updates."
+fi
 
 # --- pairing token ------------------------------------------------------------
 # The ESP rejects /notify without ?t=<token> once it has been paired. The
 # device is either:
 #   - already paired by the gifter — recipient types the token on the sticker
 #   - in open mode — anyone on LAN may pair it now by choosing a token
-device_state=$(curl -s -m 3 "http://$HOST/" | awk '/^paired/ {print $3, $4, $5}')
+device_state=$(curl -s -m "$DEV_TIMEOUT" "http://$HOST/" | awk '/^paired/ {print $3, $4, $5}')
 existing_token=""
 if [ -f "$CLAUDE_DIR/esp32-token" ]; then
   existing_token=$(tr -d ' \n\r' < "$CLAUDE_DIR/esp32-token")
@@ -94,7 +136,7 @@ if printf '%s' "$device_state" | grep -q "^no"; then
       echo "Token shape invalid (need 4-32 alphanumeric). Aborting."
       exit 1
     fi
-    pair_resp=$(curl -sf -m 5 "http://$HOST/pair?token=$new_token") || {
+    pair_resp=$(curl -sf -m "$DEV_TIMEOUT" "http://$HOST/pair?token=$new_token") || {
       echo "Pairing call failed."; exit 1; }
     echo "  $pair_resp"
     printf '%s\n' "$new_token" > "$CLAUDE_DIR/esp32-token"
@@ -106,21 +148,21 @@ if printf '%s' "$device_state" | grep -q "^no"; then
 else
   echo
   echo "Device is already paired."
-  if [ -n "$existing_token" ] && curl -sf -m 4 "http://$HOST/notify?t=$existing_token&src=__probe&status=__probe" -o /dev/null; then
+  if [ -n "$existing_token" ] && curl -sf -m "$DEV_TIMEOUT" "http://$HOST/notify?t=$existing_token&src=__probe&status=__probe" -o /dev/null; then
     # Undo the probe so we don't leave junk on the screen.
-    curl -sf -m 3 "http://$HOST/forget?t=$existing_token&src=__probe" -o /dev/null || true
+    curl -sf -m "$DEV_TIMEOUT" "http://$HOST/forget?t=$existing_token&src=__probe" -o /dev/null || true
     echo "  Existing $CLAUDE_DIR/esp32-token already works — keeping it."
   else
     printf "Enter pairing token from the device owner: "
     read -r entered_token
     entered_token=$(printf '%s' "$entered_token" | tr -d ' \n\r')
     [ -z "$entered_token" ] && { echo "No token given. Aborting."; exit 1; }
-    if ! curl -sf -m 4 "http://$HOST/notify?t=$entered_token&src=__probe&status=__probe" -o /dev/null; then
+    if ! curl -sf -m "$DEV_TIMEOUT" "http://$HOST/notify?t=$entered_token&src=__probe&status=__probe" -o /dev/null; then
       echo "Token rejected by device. Ask owner for the right one, or run"
       echo "  curl http://$HOST/show-token   (flashes it on the LCD)"
       exit 1
     fi
-    curl -sf -m 3 "http://$HOST/forget?t=$entered_token&src=__probe" -o /dev/null || true
+    curl -sf -m "$DEV_TIMEOUT" "http://$HOST/forget?t=$entered_token&src=__probe" -o /dev/null || true
     printf '%s\n' "$entered_token" > "$CLAUDE_DIR/esp32-token"
     chmod 600 "$CLAUDE_DIR/esp32-token"
     echo "Wrote $CLAUDE_DIR/esp32-token"
@@ -175,41 +217,110 @@ PY
 echo "  Merged hooks into $SETTINGS  (backup saved alongside)"
 }
 
-install_codex() {
-  cp "$SCRIPT_DIR/notify-esp32-codex.sh" "$CLAUDE_DIR/notify-esp32-codex.sh"
-  chmod +x "$CLAUDE_DIR/notify-esp32-codex.sh"
-  echo "  Installed $CLAUDE_DIR/notify-esp32-codex.sh"
-  local script="$CLAUDE_DIR/notify-esp32-codex.sh"
+# Wire the Claude Code DESKTOP app on Windows. Only meaningful from WSL: the
+# desktop app has no notifier of its own, it calls back into this distro and
+# reuses the same notify-esp32.sh with a "win" host argument.
+install_claude_desktop() {
+  # The desktop hooks execute the WSL-resident script, so it must exist even
+  # if the user declined the CLI wiring a moment ago.
+  if [ ! -x "$CLAUDE_DIR/notify-esp32.sh" ]; then
+    cp "$SCRIPT_DIR/notify-esp32.sh" "$CLAUDE_DIR/notify-esp32.sh"
+    chmod +x "$CLAUDE_DIR/notify-esp32.sh"
+    echo "  Installed $CLAUDE_DIR/notify-esp32.sh (needed by the desktop hooks)"
+  fi
 
-  # Locate the Codex home (config.toml lives here).
-  local cdir=""
-  if [ -n "$CODEX_HOME" ] && [ -d "$CODEX_HOME" ]; then
-    cdir="$CODEX_HOME"
-  elif [ -d "$HOME/.codex" ]; then
-    cdir="$HOME/.codex"
-  elif grep -qi microsoft /proc/version 2>/dev/null; then
-    # WSL with Codex installed on the Windows side.
+  # Locate %USERPROFILE%\.claude as seen from WSL.
+  local wdir="" winprofile=""
+  winprofile=$(powershell.exe -NoProfile -Command 'Write-Output $env:USERPROFILE' 2>/dev/null | tr -d ' \r\n') || true
+  if [ -n "$winprofile" ] && command -v wslpath >/dev/null 2>&1; then
+    local conv
+    conv=$(wslpath -u "$winprofile" 2>/dev/null) || conv=""
+    [ -n "$conv" ] && [ -d "$conv" ] && wdir="$conv/.claude"
+  fi
+  if [ -z "$wdir" ]; then
     local d
-    for d in /mnt/c/Users/*/.codex; do
-      if [ -f "$d/config.toml" ]; then cdir="$d"; break; fi
+    for d in /mnt/c/Users/*/.claude; do
+      [ -d "$d" ] && { wdir="$d"; break; }
     done
   fi
-  if [ -z "$cdir" ]; then
-    printf "  Could not find a Codex home. Enter path to your .codex dir (Enter to skip): "
-    read -r cdir
-    cdir=$(printf '%s' "$cdir" | tr -d ' \n\r')
-    [ -z "$cdir" ] && { echo "  Skipped Codex."; return; }
+  if [ -z "$wdir" ]; then
+    printf "  Could not find your Windows .claude dir. Enter it (Enter to skip): "
+    read -r wdir
+    wdir=$(printf '%s' "$wdir" | tr -d ' \n\r')
+    [ -z "$wdir" ] && { echo "  Skipped Claude Code desktop."; return; }
   fi
-  [ -d "$cdir" ] || { echo "  $cdir is not a directory — skipping Codex."; return; }
+  mkdir -p "$wdir" 2>/dev/null || { echo "  Cannot write $wdir — skipping desktop."; return; }
+
+  local wsettings="$wdir/settings.json"
+  [ -f "$wsettings" ] || echo "{}" > "$wsettings"
+  cp "$wsettings" "$wsettings.bak.$(date +%Y%m%d-%H%M%S)"
+
+  # MSYS_NO_PATHCONV=1 is not optional. The desktop app runs hooks through Git
+  # Bash, whose MSYS2 layer rewrites absolute POSIX arguments, so a bare
+  # /home/... path reaches wsl.exe as C:/Program Files/Git/home/... and fails.
+  # Equally: do NOT wrap this in `cmd.exe /c`. Under Git Bash that becomes an
+  # interactive cmd which consumes the JSON payload from stdin and exits 0,
+  # reporting success while never contacting the device.
+  WSETTINGS="$wsettings" NOTIFY="$CLAUDE_DIR/notify-esp32.sh" python3 - <<'PY'
+import json, os
+path   = os.environ["WSETTINGS"]
+notify = os.environ["NOTIFY"]
+try:
+    with open(path) as f:
+        settings = json.load(f)
+        if not isinstance(settings, dict):
+            settings = {}
+except Exception:
+    settings = {}
+
+events = {
+    "UserPromptSubmit": "working",
+    "Stop":             "done",
+    "Notification":     "action",
+    "PreToolUse":       "clear",
+    "SessionEnd":       "closed",
+}
+
+hooks = settings.get("hooks", {}) or {}
+for event, mode in events.items():
+    cmd = f"MSYS_NO_PATHCONV=1 wsl.exe -e {notify} {mode} win"
+    kept = []
+    for h in (hooks.get(event, []) or []):
+        cmds = [hh.get("command", "") for hh in h.get("hooks", [])]
+        if any("notify-esp32.sh" in c for c in cmds):
+            continue
+        kept.append(h)
+    kept.append({"matcher": "", "hooks": [{"type": "command", "command": cmd}]})
+    hooks[event] = kept
+settings["hooks"] = hooks
+
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PY
+  echo "  Merged desktop hooks into $wsettings  (backup saved alongside)"
+  echo "  NOTE: quit the Claude desktop app COMPLETELY and relaunch it."
+  echo "        settings.json is read once at startup; check the system tray too."
+}
+
+install_codex_home() {
+  local cdir="$1"
+  local script="$CLAUDE_DIR/notify-esp32-codex.sh"
+  [ -d "$cdir" ] || { echo "  $cdir is not a directory — skipping it."; return; }
   local conf="$cdir/config.toml"
   [ -f "$conf" ] || : > "$conf"
 
   # Codex runs the hook on its own OS. If its home is a Windows mount, Codex is
   # the Windows build and reaches the WSL script via wsl.exe; otherwise it calls
   # the script directly.
-  local run="$script"
+  # A Windows-mounted Codex home means the Windows build, which reaches the
+  # WSL-resident script through wsl.exe and takes the "win" host argument.
+  # That argument tags the cell (Codex W) and, importantly, makes the script
+  # run synchronously: a job backgrounded inside `wsl.exe -e` is killed the
+  # moment the command returns, because WSL reaps the whole session.
+  local run="$script" hostarg=""
   case "$cdir" in
-    /mnt/[a-z]/*) run="wsl.exe -e $script" ;;
+    /mnt/[a-z]/*) run="wsl.exe -e $script"; hostarg=" win" ;;
   esac
 
   cp "$conf" "$conf.bak.$(date +%Y%m%d-%H%M%S)"
@@ -222,25 +333,32 @@ install_codex() {
 matcher = ""
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = '$run working'
+command = '$run working$hostarg'
 
 [[hooks.Stop]]
 matcher = ""
 [[hooks.Stop.hooks]]
 type = "command"
-command = '$run done'
+command = '$run done$hostarg'
 
 [[hooks.PermissionRequest]]
 matcher = ""
 [[hooks.PermissionRequest.hooks]]
 type = "command"
-command = '$run action'
+command = '$run action$hostarg'
 
 [[hooks.PreToolUse]]
 matcher = ""
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = '$run clear'
+command = '$run clear$hostarg'
+
+[[hooks.SessionEnd]]
+matcher = ""
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = '$run closed$hostarg'
+timeout = 3
 # <<< claude-rlcd codex hooks <<<
 EOF
 )
@@ -252,17 +370,83 @@ try:
     with open(conf) as f: text = f.read()
 except Exception:
     text = ""
-# Strip any prior managed block, then append the fresh one at EOF.
-text = re.sub(
-    r"\n*# >>> claude-rlcd codex hooks.*?# <<< claude-rlcd codex hooks <<<\n?",
-    "\n", text, flags=re.S)
+
+# Our block sits at EOF, and Codex appends keys it writes itself (notably
+# [projects."<dir>"] trust_level) to EOF too — so they land *inside* the
+# markers. Stripping the whole span would silently delete them. Remove only
+# the tables we generated and re-emit anything else above the fresh block.
+OURS = re.compile(
+    r"\[\[hooks\.(?:UserPromptSubmit|Stop|PermissionRequest|PreToolUse|SessionEnd)"
+    r"(?:\.hooks)?\]\]$")
+HEADER = re.compile(r"\[\[?[^\[\]]+\]\]?$")
+MARKER = re.compile(r"# (?:>>>|<<<) claude-rlcd codex hooks")
+
+def strip_managed(text):
+    m = re.search(
+        r"\n*# >>> claude-rlcd codex hooks.*?# <<< claude-rlcd codex hooks <<<\n?",
+        text, flags=re.S)
+    if not m:
+        return text
+    kept, cur, keep = [], [], False
+    for line in m.group(0).splitlines():
+        s = line.strip()
+        if MARKER.search(s):
+            continue
+        if HEADER.match(s):
+            if keep: kept.extend(cur)
+            cur, keep = [line], not OURS.match(s)
+        elif keep:
+            cur.append(line)
+    if keep: kept.extend(cur)
+    foreign = "\n".join(kept).strip("\n")
+    return text[:m.start()] + ("\n" + foreign + "\n" if foreign else "\n") + text[m.end():]
+
+text = strip_managed(text)
 text = text.rstrip("\n")
 text = (text + "\n\n" if text else "") + block + "\n"
 with open(conf, "w") as f:
     f.write(text)
 PY
   echo "  Wrote Codex hooks into $conf  (backup saved alongside)"
-  echo "  NOTE: Codex trust-gates hooks — approve them on your first 'codex' run."
+}
+
+install_codex() {
+  cp "$SCRIPT_DIR/notify-esp32-codex.sh" "$CLAUDE_DIR/notify-esp32-codex.sh"
+  chmod +x "$CLAUDE_DIR/notify-esp32-codex.sh"
+  echo "  Installed $CLAUDE_DIR/notify-esp32-codex.sh"
+
+  # Wire *every* Codex home found, not just the first. A WSL box commonly has
+  # two — the native CLI in ~/.codex and the Windows build under
+  # /mnt/c/Users/<you>/.codex — and each needs a differently-shaped hook
+  # command (the Windows one goes through wsl.exe and takes the "win" arg).
+  # Configuring only one silently left the other agent unable to reach the
+  # display, which looked exactly like a broken hook.
+  local -a cdirs=()
+  local d c seen
+  for d in ${CODEX_HOME:+"$CODEX_HOME"} "$HOME/.codex" \
+           $(grep -qi microsoft /proc/version 2>/dev/null && echo /mnt/c/Users/*/.codex); do
+    [ -d "$d" ] || continue
+    seen=""
+    for c in "${cdirs[@]}"; do [ "$c" = "$d" ] && seen=1; done
+    [ -n "$seen" ] || cdirs+=("$d")
+  done
+
+  if [ ${#cdirs[@]} -eq 0 ]; then
+    local entered
+    printf "  Could not find a Codex home. Enter path to your .codex dir (Enter to skip): "
+    read -r entered
+    entered=$(printf '%s' "$entered" | tr -d ' \n\r')
+    [ -z "$entered" ] && { echo "  Skipped Codex."; return; }
+    cdirs=("$entered")
+  fi
+
+  for d in "${cdirs[@]}"; do install_codex_home "$d"; done
+
+  echo "  NOTE: Codex trust-gates hooks — until you approve them they report"
+  echo "        enabled but never fire. In the CLI, run 'codex' once and choose"
+  echo "        'Trust all and continue'. The desktop app has no hooks UI at all;"
+  echo "        see the Codex section of the README for the by-hand procedure."
+  echo "        Check any time with: tools/codex-hooks-status.py"
 }
 
 echo
@@ -272,6 +456,20 @@ case "$want_claude" in
   [nN]*) echo "  Skipped Claude Code." ;;
   *)     install_claude ;;
 esac
+
+# Offered only under WSL: the desktop app reaches the notifier through
+# wsl.exe, so there is nothing to wire from a native Linux or macOS install.
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  echo
+  echo "The Claude Code desktop app on Windows is configured separately from"
+  echo "the CLI (its own settings.json in your Windows profile)."
+  printf "Set up Claude Code desktop for Windows? [y/N]: "
+  read -r want_desktop
+  case "$want_desktop" in
+    [yY]*) install_claude_desktop ;;
+    *)     echo "  Skipped Claude Code desktop." ;;
+  esac
+fi
 
 echo
 printf "Set up Codex? [y/N]: "

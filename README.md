@@ -5,10 +5,22 @@ A 4.2" 400×300 reflective LCD that lights up with `WORKING` / `DONE` /
 5-hour session %, weekly cost, and per-source breakdowns.
 
 Wired to Claude Code via Stop / UserPromptSubmit / Notification / PreToolUse
-hooks. Supports multiple parallel Claude Code sessions with distinct labels.
-**Codex** (OpenAI's CLI) is supported too, through its own lifecycle hooks; it
-gets its own `(Codex)` cells alongside the `(Code)` ones. See *Codex support*
-below.
+hooks. Supports multiple parallel sessions with distinct labels.
+
+Four agent installs can drive the same device at once, each claiming its own
+cell:
+
+| Driver | Cell tag | Config it reads |
+|---|---|---|
+| Claude Code CLI (Linux / macOS / WSL) | `(Code)` | `~/.claude/settings.json` |
+| Claude Code desktop (Windows) | `(Code W)` | `%USERPROFILE%\.claude\settings.json` |
+| Codex CLI (Linux / macOS / WSL) | `(Codex)` | `~/.codex/config.toml` |
+| Codex (Windows) | `(Codex W)` | `%USERPROFILE%\.codex\config.toml` |
+
+The trailing `W` marks a session living on the Windows side. Nothing in the
+firmware knows about any of this: `/notify` is provider-agnostic and simply
+renders whatever label it is handed. See *Claude Code desktop (Windows)* and
+*Codex support* below.
 
 Single-tap the on-board KEY button to flip the screen into an ambient
 **calendar view** of today's events — date header, start + end times, a "now"
@@ -25,6 +37,20 @@ The firmware is already on the board. To set it up on a new WiFi:
 2. **From your phone**, open WiFi settings and join `Claude-RLCD-Setup`. A
    captive-portal browser tab opens automatically on most phones (if not, visit
    `http://192.168.4.1/`). Pick your home WiFi and enter the password.
+
+   > **Pick a 2.4GHz network.** The ESP32-S3 has no 5GHz radio at all, so an
+   > SSID like `myrouter 5G` can never be joined; the board reports
+   > `Reason: 201 NO_AP_FOUND` and drops straight back into the portal, which
+   > looks exactly like the setup screen never responding. Most dual-band
+   > routers publish the 2.4GHz network as the same name without the `5G`
+   > suffix. The list the portal shows you is scanned by the board itself, so
+   > **whatever appears in that list is joinable**; if your network is missing
+   > from it, the router's 2.4GHz radio is off or hidden.
+   >
+   > Your computer may stay on the 5GHz SSID. That is fine as long as both
+   > bands bridge to the same LAN, which is the default on a single router.
+   > Check with `ping claude-rlcd.local` after setup; if it fails, move the
+   > computer to the 2.4GHz SSID too.
 3. The board reboots and joins your network. The screen shows the device IP in
    small text in the top-right block (e.g. `ip 192.168.1.42`).
 4. **On each computer that runs Claude Code**, clone or copy this folder, then:
@@ -33,15 +59,25 @@ The firmware is already on the board. To set it up on a new WiFi:
    ```
    It discovers the ESP at `http://claude-rlcd.local/` (or asks for the IP if
    mDNS isn't available — common on WSL2), prompts you for the pairing token
-   the gifter wrote on the sticker (e.g. `20030102`), then asks two yes/no
-   questions: **"Set up Claude Code?"** and **"Set up Codex?"**. Answer each
-   to wire that agent (you can pick one, both, or neither). For Claude it
-   copies the hook script to `~/.claude/` and merges hooks into
+   the gifter wrote on the sticker (e.g. `20030102`), then asks a yes/no
+   question per agent: **"Set up Claude Code?"**, **"Set up Claude Code
+   desktop for Windows?"** (WSL only, see step 6), and **"Set up Codex?"**.
+   Answer each to wire that agent; you can pick any combination, or none. For
+   Claude it copies the hook script to `~/.claude/` and merges hooks into
    `~/.claude/settings.json` without touching your other settings; for Codex
    see *Codex support* below. If the gifter forgot the sticker, run `curl
    http://claude-rlcd.local/show-token` and read the token off the LCD.
 5. **Start a new Claude Code (or Codex) session.** The screen flips to
    `WORKING` on your first prompt and `DONE` when the agent finishes.
+
+6. **Using the Claude Code desktop app on Windows?** Run `./install.sh` from a
+   WSL shell and answer `y` to **"Set up Claude Code desktop for Windows?"**.
+   It finds `%USERPROFILE%\.claude\`, merges the hooks in (backing the file up
+   first, leaving your other settings alone), and applies the mandatory
+   `MSYS_NO_PATHCONV=1` prefix. Then **quit the desktop app completely and
+   relaunch it**. The prompt only appears under WSL, since the desktop hooks
+   reach the notifier through `wsl.exe`. See *Claude Code desktop (Windows)*
+   below for what it configures and why.
 
 That's it. The rest of this README is reference and troubleshooting.
 
@@ -49,7 +85,12 @@ That's it. The rest of this README is reference and troubleshooting.
 
 - **Board:** Waveshare ESP32-S3-RLCD-4.2 (400×300 monochrome reflective LCD, ST7305 controller).
 - **GPIOs used:** SCK=11, MOSI=12, DC=5, CS=40, RST=41 (LCD), GPIO18 (KEY button, active-low, internal pull-up).
-- **USB:** the single USB-C is both UART (via CH343) and the upload port.
+- **USB:** the single USB-C is both console and upload port. It enumerates as
+  the ESP32-S3's **native USB-Serial/JTAG** peripheral, VID:PID `303A:1001`,
+  not through a CH343 bridge. On Windows it appears as `USB Serial Device
+  (COMn)`; the COM number is assigned by Windows and **changes between
+  machines and re-plugs**, so look it up rather than assuming (see
+  *Re-flashing the firmware*).
 
 ## What's in this folder
 
@@ -62,11 +103,17 @@ claude-to-RLCD/
 │   └── ST7305_U8g2.cpp/.h       Waveshare ST7305 driver wrapper (vendored)
 ├── notify-esp32.sh              Claude hook script — installed to ~/.claude/
 ├── notify-esp32-codex.sh        Codex hook script — installed to ~/.claude/
-├── settings-snippet.json        Claude hook config — merged into ~/.claude/settings.json
+├── settings-snippet.json        Claude CLI hook config — merged into ~/.claude/settings.json
+├── settings-snippet-desktop-windows.json
+│                                Claude DESKTOP hook config — merged into
+│                                %USERPROFILE%\.claude\settings.json (see below)
 ├── install.sh                   one-shot installer for each driving machine
 ├── uninstall.sh                 reverse of install.sh on a single machine
 └── tools/
     ├── calendar-push.py         ICS sidecar (calendar view); driven by a 5-min timer
+    ├── codex-hooks-status.py    asks Codex which hooks it loaded and whether they
+    │                            are trusted — the only way to diagnose a Codex
+    │                            hook that is "enabled" but silently never fires
     ├── vendor/                  bundled pure-Python wheels for offline install (icalendar etc.)
     └── .venv/                   self-contained Python env (created by install.sh; gitignored)
 ```
@@ -75,16 +122,32 @@ claude-to-RLCD/
 
 Each Code source on screen carries a label, with a 4-char session suffix
 appended so two terminals open in the same folder still land in separate
-cells. The suffix is the first 4 chars of `$CLAUDE_CODE_SESSION_ID` (a UUID
-Claude exposes per terminal, stable for the life of the session), e.g.
-`thesis/9838 (Code)` and `thesis/a1c2 (Code)` for two `claude` sessions in
-`~/thesis`. Base-name priority:
+cells, e.g. `thesis/9838 (Code)` and `thesis/a1c2 (Code)` for two `claude`
+sessions in `~/thesis`.
 
-1. `~/.claude/session-label` (file, edit anytime — no Claude restart needed)
+The suffix is the first 4 chars of the `session_id` field in the JSON payload
+Claude pipes to the hook on stdin. It is **not** read from an environment
+variable: `$CLAUDE_CODE_SESSION_ID` exists in the `claude` process but is not
+exported to hook subprocesses, so anything relying on it silently produces an
+empty suffix. Base-name priority:
+
+1. `~/.claude/session-label` (file, edit anytime, no Claude restart needed)
 2. `$CLAUDE_SESSION_LABEL` (env var, set before launching `claude`)
-3. PWD basename (so each project folder gets its own cell automatically)
-4. `$WSL_DISTRO_NAME` (e.g. `Ubuntu`, `Test`)
-5. hostname
+3. basename of the hook payload's `cwd` (so each project folder gets its own
+   cell automatically; handles Windows paths and spaces)
+4. PWD basename, local CLI sessions only
+5. `$WSL_DISTRO_NAME` (e.g. `Ubuntu`, `Test`)
+6. hostname
+
+(3) outranks (4) because a hook bridged in from Windows sees `$PWD` as
+wherever `wsl.exe` landed, typically `/mnt/c`, which would label every desktop
+session `c`. For that reason `$PWD` is skipped entirely when the hook was
+invoked with the `win` argument.
+
+A session on the Windows side additionally carries a ` W` in its tag, giving
+`(Code W)` and `(Codex W)`. The separator is a plain ASCII space: labels are
+drawn with u8g2's `drawStr`, which walks raw bytes rather than decoding UTF-8,
+so a multi-byte character such as `·` renders as garbage glyphs.
 
 Rename the running session on the fly:
 ```bash
@@ -107,6 +170,142 @@ session evicts them, or until you clear manually with (where
 curl "http://claude-rlcd.local/forget?t=$T&src=Foo%20(Code)"
 curl "http://claude-rlcd.local/forget?t=$T&all=1"
 ```
+
+## Claude Code desktop (Windows)
+
+The Windows desktop app drives the same device as the CLI. It has no notifier
+of its own: its hooks call into WSL and reuse the very same
+`~/.claude/notify-esp32.sh`, passing a second argument `win` so the cell is
+tagged `(Code W)` and usage stats are suppressed.
+
+**Prerequisites.** WSL must be installed, and the CLI side must already be set
+up inside your distro (`./install.sh` from a WSL shell). The desktop app does
+not carry its own copy of the script; it borrows the one in your WSL home.
+Confirm it is there before going further:
+
+```bash
+wsl.exe -e ls -l /home/<you>/.claude/notify-esp32.sh
+```
+
+**The easy path** is `./install.sh` from a WSL shell, answering `y` to "Set up
+Claude Code desktop for Windows?". Everything below documents what it writes,
+for hand-configuration or debugging.
+
+**Config location.** The desktop app reads the same `settings.json` schema as
+the CLI, from your Windows profile, not your WSL home:
+
+```
+C:\Users\<you>\.claude\settings.json
+```
+
+Create it if absent (a fresh install has only `backups\` and `sessions\`). If
+the file already exists, merge the `hooks` key in rather than overwriting, the
+same way `install.sh` does on the CLI side.
+
+`settings-snippet-desktop-windows.json` in this repo is the same content ready
+to copy, with the reasoning inlined as comments; delete its `_comment` key
+after merging.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [ { "type": "command",
+        "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh working win" } ] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [ { "type": "command",
+        "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh done win" } ] }
+    ],
+    "Notification": [
+      { "matcher": "", "hooks": [ { "type": "command",
+        "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh action win" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "", "hooks": [ { "type": "command",
+        "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh clear win" } ] }
+    ],
+    "SessionEnd": [
+      { "matcher": "", "hooks": [ { "type": "command",
+        "command": "MSYS_NO_PATHCONV=1 wsl.exe -e /home/<you>/.claude/notify-esp32.sh closed win" } ] }
+    ]
+  }
+}
+```
+
+Replace `<you>` with your WSL username (the path is a Linux path, not a
+Windows one). Then **quit the desktop app completely and relaunch it**;
+`settings.json` is read once at startup, and a running instance will not pick
+up your edits. Check the tray as well as the window.
+
+### Two things that will bite you
+
+**1. `MSYS_NO_PATHCONV=1` is mandatory.** The desktop app runs hook commands
+through **Git Bash**, not `cmd.exe`. MSYS2 rewrites any argument that looks
+like an absolute POSIX path, so a bare `/home/you/.claude/notify-esp32.sh`
+arrives at `wsl.exe` as `C:/Program Files/Git/home/you/.claude/notify-esp32.sh`
+and dies with:
+
+```
+WSL ERROR: CreateProcessCommon:818:
+execvpe(C:/Program Files/Git/home/you/.claude/notify-esp32.sh)
+failed: No such file or directory
+```
+
+The prefix disables that rewriting. Nothing else about the command changes.
+
+**2. Do not wrap the command in `cmd.exe /c`.** It is a natural instinct on
+Windows and it fails in a way that hides itself: under Git Bash the nested
+invocation becomes an *interactive* `cmd`, which reads the hook's JSON payload
+off stdin and echoes it at its own prompt as though you had typed it, then
+exits 0. Claude records the hook as **successful**, no error appears anywhere,
+and the device is never contacted. If you ever see a Windows banner and a
+`D:\...>` prompt in a hook's captured stdout, this is what happened.
+
+### Behaviour differences from the CLI
+
+- **Usage stats are blank by design.** `ccusage` runs inside WSL and reads
+  WSL's `~/.claude/projects`; the desktop app keeps its own history in its
+  MSIX container, so any figure reported against a desktop cell would be the
+  CLI's numbers. Blank is honest. Desktop pings leave the `5h% / reset / week$`
+  block untouched rather than clearing it, so a CLI session's figures keep
+  showing.
+- **Expect roughly a 2 second pause when you press send.** The hook runs
+  synchronously, because a job backgrounded inside `wsl.exe -e` is killed the
+  moment the command returns (WSL reaps the whole session; `setsid` and
+  `nohup` do not escape it). Most of that 2s is the firmware repainting the
+  panel before it answers the HTTP request.
+- **Labels come from the hook payload's `cwd`**, so a desktop session in
+  `D:\Research\My Project` shows as `My Project/1a2b (Code W)`. Windows paths
+  and spaces are both handled.
+
+### If nothing appears on the screen
+
+Do not guess at shells; the app writes down exactly what happened. Open the
+session transcript:
+
+```
+C:\Users\<you>\.claude\projects\<slugified-cwd>\<session-id>.jsonl
+```
+
+Every hook leaves a record there. Look for `"type": "hook_non_blocking_error"`
+(carries the raw `stderr`), `"type": "hook_success"` (carries the captured
+`stdout`), and `"subtype": "stop_hook_summary"` (lists each command with its
+`durationMs`). Two greps that answer most questions:
+
+```bash
+grep -o '"stderr":"[^"]*"'  <session-id>.jsonl
+grep -o '"command":"[^"]*"' <session-id>.jsonl
+```
+
+Common outcomes:
+
+| What you see | Cause |
+|---|---|
+| `execvpe(C:/Program Files/Git/...)` | missing `MSYS_NO_PATHCONV=1` |
+| stdout contains a `Microsoft Windows [Version ...]` banner | command wrapped in `cmd.exe /c` |
+| No hook records at all | app not restarted, or `settings.json` is in the wrong place / malformed JSON |
+| Hook succeeds, still no cell | device unreachable: check `ping claude-rlcd.local` and that `~/.claude/esp32-ip` and `esp32-token` exist **inside WSL** |
 
 ## Codex support
 
@@ -132,10 +331,30 @@ cells. The event mapping mirrors the Claude one:
    installer replaces rather than duplicates them. The existing `config.toml`
    is backed up alongside first.
 
-If Codex lives on a Windows mount while you install from WSL (the common WSL
-case), the hook command is generated as `wsl.exe -e ~/.claude/notify-esp32-codex.sh <mode>`
-so the Windows Codex build reaches the WSL-resident script; on a native
-Linux/macOS Codex it calls the script directly.
+Codex on Windows and Codex inside WSL are **two separate installs with two
+separate `config.toml` files**, and you can run both. They differ only in how
+the hook command reaches the script:
+
+```toml
+# ~/.codex/config.toml  — Codex running natively in WSL/Linux/macOS. Cells: (Codex)
+command = '/home/<you>/.claude/notify-esp32-codex.sh working'
+
+# %USERPROFILE%\.codex\config.toml  — Codex on Windows. Cells: (Codex W)
+command = 'wsl.exe -e /home/<you>/.claude/notify-esp32-codex.sh working win'
+```
+
+The trailing `win` is what earns the `(Codex W)` tag. As with the desktop app,
+a Windows-bridged hook runs **synchronously**: a job backgrounded inside
+`wsl.exe -e` is killed when the command returns, because WSL reaps the entire
+session (`setsid` and `nohup` do not escape it either).
+
+> **If the Windows Codex hooks fire but no cell appears**, check whether Codex
+> spawns hooks through Git Bash. If it does, the bare `/home/...` argument is
+> being rewritten to `C:/Program Files/Git/home/...` and you need the
+> `MSYS_NO_PATHCONV=1` prefix described under *Claude Code desktop (Windows)*.
+> If Codex uses `cmd.exe`, the bare path is correct and the prefix would break
+> it. The two cases are distinguished by the error text, so read the log
+> before changing anything.
 
 **Codex session labels** work like the Claude ones but read from their own
 sources, in priority order:
@@ -153,18 +372,75 @@ misleading under a `(Codex)` label, so `sp` / `r` / `wc` are left blank.
 
 **Caveats:**
 
-- **Trust gating.** Codex will not run a hook until you trust it (it records a
-  hash). Approve the hooks on your first interactive `codex` session, or run
-  once with `--dangerously-bypass-hook-trust` (skips the safety check; prefer
-  the prompt).
-- **No auto-forget.** Codex has no documented session-end event, so unlike the
-  Claude `SessionEnd` -> `/forget` path, a `(Codex)` cell lingers until it is
-  overwritten or evicted by a 5th source. Clear it manually with
+- **Trust gating — this is the one that will catch you.** Codex will not run a
+  hook until you trust it, and an untrusted hook reports `enabled: true` while
+  silently never firing. There is no error anywhere; it just does nothing.
+  - **Codex CLI:** run `codex` interactively once. It shows "Hooks need
+    review" at startup — choose *Trust all and continue*. (`codex exec` never
+    shows that prompt, so it can never grant trust.)
+  - **Codex desktop: there is no hooks UI at all.** The GUI never calls any
+    `hooks/*` method, so the approval dialog that fixes this does not exist.
+    Trust has to be written into `config.toml` by hand — see below.
+  - The hash covers the **whole hook entry**, not just the command string —
+    adding or changing a field like `timeout` re-arms the gate too (it then
+    reports `trust=modified` rather than `untrusted`). Re-running `install.sh`
+    without changing a hook keeps that hook's existing trust; only the entries
+    you actually changed need re-approving.
+  - `codex doctor` does not mention hooks and will not diagnose this. Use
+    `tools/codex-hooks-status.py`, which asks Codex itself and prints every
+    hook's `enabled` state and `trustStatus` in one call.
+- **Granting trust by hand** (needed on Codex desktop). `trusted_hash` is not a
+  plain sha256 of the command, so it cannot be computed — you have to read it
+  from Codex, and from the *same binary* that will run the hooks, since the
+  hashes differ per install. Point the status tool at the desktop build with
+  `CODEX_BIN`:
+
+  ```bash
+  CODEX_BIN='/mnt/c/Users/<you>/AppData/Local/OpenAI/Codex/bin/<hash>/codex.exe' \
+    python3 tools/codex-hooks-status.py --json
+  ```
+
+  Take each hook's `key` and `currentHash` and add one sibling table per hook
+  (note: a sibling table, not a field inside the hook entry — nesting it is
+  silently ignored):
+
+  ```toml
+  [hooks.state."/home/you/.codex/config.toml:pre_tool_use:0:0"]
+  trusted_hash = "sha256:..."
+  ```
+
+  The key is `<sourcePath>:<snake_case_event>:<group_idx>:<hook_idx>`. Use a
+  single-quoted TOML literal key for Windows paths so the backslashes survive.
+  Re-run the status tool afterwards and confirm `trustStatus` flipped to
+  `trusted`.
+- **One Codex home per run.** `install.sh` wires the first Codex install it
+  finds (`$CODEX_HOME`, then `~/.codex`, then a Windows `.codex` under
+  `/mnt/c/Users/*`). If you run Codex both natively *and* on Windows, only the
+  first is configured — set up the second by hand, or re-run with `CODEX_HOME`
+  pointed at it. `uninstall.sh` has the same one-home limitation.
+- **Auto-forget works.** Codex gained a `SessionEnd` event in 0.147.0 (0.142
+  alpha did not have it), and `install.sh` now wires it to `notify-esp32-codex.sh
+  closed`, so a `(Codex)` cell removes itself when the session ends instead of
+  lingering until something evicts it. Requires 0.147.0 or newer; on an older
+  Codex the hook is simply never called and the cell lingers as before, which
+  you can still clear by hand with
   `curl "http://claude-rlcd.local/forget?t=$T&src=<label>%20(Codex)"`.
-- **Alpha surface.** Codex hooks are recent (verified on `codex-cli`
-  0.142.0-alpha.1) and the schema may shift. If a hook stops firing after a
-  Codex update, run `codex doctor` to confirm `config.toml parse ok` and that
-  the block is still valid.
+- **Hooks get one second, and Codex enforces it.** Hook execution is capped at
+  `timeout` seconds — default 1, and it really does kill the process partway
+  (a deliberate 3s sleep was cut off mid-run during testing). Two consequences:
+  - The notifier only fits because it talks to a **cached IP** (~0.2s round
+    trip). If `~/.claude/esp32-ip` ever falls back to holding the mDNS name,
+    resolution alone costs 1.2-1.6s and every Codex hook is killed first.
+  - The `SessionEnd` hook is the exception and gets `timeout = 3`, the largest
+    value Codex accepts (it silently clamps anything higher). It needs the
+    headroom because it waits ~1s before calling `/forget`: Codex fires `Stop`
+    and `SessionEnd` in the same second and `Stop` self-backgrounds, so without
+    the pause the backgrounded `done` lands *after* the forget and immediately
+    recreates the cell that was just removed.
+- **Alpha surface.** Codex hooks are recent and the schema may shift. Verified
+  on `codex-cli` 0.147.0 (WSL) and 0.148.0-alpha.9 (the Windows desktop
+  bundle) — behaviour does not always transfer between the two, so check the
+  version before porting a fix.
 - **Teardown.** `uninstall.sh` removes the Codex pieces too: it deletes
   `~/.claude/notify-esp32-codex.sh` and strips the marked block from the Codex
   `config.toml` (backing it up first), alongside the Claude cleanup.
@@ -481,6 +757,10 @@ block from the Codex `config.toml`, and tears down the calendar auto-refresh
 timer (systemd-user / launchd / cron) if `install.sh` set one up. Every other
 setting in `settings.json` is preserved.
 
+Under WSL it also strips the desktop app's hooks from
+`%USERPROFILE%\.claude\settings.json`, backing that file up alongside first.
+Restart the desktop app afterwards for the change to take effect.
+
 **Then deleting the cloned repo folder:** if you're on WSL/Linux/macOS, plain
 `rm -rf` works. If you're deleting from **Windows Explorer**, run
 `./uninstall.sh --purge-calendar` first — without it, `tools/.venv/` survives
@@ -524,32 +804,103 @@ Recipients of a pre-flashed board do not.
 **In Windows VS Code with the PlatformIO IDE extension**: open this folder and
 click PlatformIO **Upload** (→).
 
-**From a WSL shell**:
+**From a WSL shell**. Find the port first; it is not stable across machines or
+re-plugs. The board is the one with hardware ID `VID:PID=303A:1001`:
+
 ```bash
+PIO=/mnt/c/Users/<you>/.platformio/penv/Scripts
+"$PIO/pio.exe" device list                     # note the COMn for 303A:1001
 cd /mnt/d/dev/claude-to-RLCD
-/mnt/c/Users/75972/.platformio/penv/Scripts/platformio.exe run --target upload --upload-port COM7
+"$PIO/pio.exe" run --target upload --upload-port COM3
 ```
 
-**Upload fails / no COM port** — hold BOOT, tap PWR, release BOOT, retry.
+**Upload fails / no COM port**: hold BOOT, tap PWR, release BOOT, retry.
+
+**What a re-flash does and does not erase.** The NVS partition sits at the
+same `0x9000` offset in both the Arduino and factory layouts, so **stored WiFi
+credentials survive** a re-flash and the board will rejoin its old network.
+The pairing token does **not** survive, because it lives in the firmware's own
+Preferences namespace; the board comes back up in open mode showing `PAIR ME`,
+and you re-pair with:
+
+```bash
+curl "http://claude-rlcd.local/pair?token=$(cat ~/.claude/esp32-token)"
+```
+
+**Backing up first.** If the board is carrying firmware you might want back
+(for example the Waveshare `03_Fac` factory demo it ships with), dump the
+whole chip before overwriting. It takes about 3 minutes:
+
+```bash
+ESPTOOL=/mnt/c/Users/<you>/.platformio/packages/tool-esptoolpy/esptool.py
+python "$ESPTOOL" --port COM3 --baud 921600 read_flash 0 0x1000000 factory-backup.bin
+# restore with:
+python "$ESPTOOL" --port COM3 --baud 921600 write_flash 0 factory-backup.bin
+```
 
 ### Reading the boot log from WSL (no extra tools)
 
-`HardwareSerial` output is silent on this board (the native-USB serial isn't
-broken out). Diagnostics are emitted via `esp_rom_printf`. To capture them
-from WSL:
+Arduino's `Serial` is silent on this board. `platformio.ini` builds with
+`-DARDUINO_USB_CDC_ON_BOOT=0`, which points `Serial` at UART0 (GPIO43/44),
+and that UART is not wired to the USB-C socket. Diagnostics therefore go out
+via `esp_rom_printf`, which writes to the ROM console, i.e. the native
+USB-Serial/JTAG interface you are already plugged into.
+
+Save this once as `listen.ps1` somewhere on the Windows side:
 
 ```powershell
-powershell.exe -NoProfile -Command "& { \$p = New-Object System.IO.Ports.SerialPort 'COM7',115200,'None',8,'One'; \$p.ReadTimeout = 200; \$p.DtrEnable = \$false; \$p.RtsEnable = \$false; \$p.Open(); \$p.RtsEnable = \$true; Start-Sleep -Milliseconds 100; \$p.RtsEnable = \$false; \$end = (Get-Date).AddSeconds(15); while ((Get-Date) -lt \$end) { Start-Sleep -Milliseconds 100; if (\$p.BytesToRead -gt 0) { Write-Host -NoNewline \$p.ReadExisting() } }; \$p.Close() }"
+param([string]$Port = 'COM3', [int]$Seconds = 15, [switch]$Reset)
+$p = New-Object System.IO.Ports.SerialPort $Port,115200,'None',8,'One'
+$p.ReadTimeout = 200; $p.DtrEnable = $false; $p.RtsEnable = $false
+$p.Open()
+if ($Reset) { $p.RtsEnable = $true; Start-Sleep -Milliseconds 100; $p.RtsEnable = $false }
+$end = (Get-Date).AddSeconds($Seconds)
+while ((Get-Date) -lt $end) {
+  Start-Sleep -Milliseconds 100
+  if ($p.BytesToRead -gt 0) { Write-Host -NoNewline $p.ReadExisting() }
+}
+$p.Close()
 ```
 
-Look for `[wifi] ip=...` and `[mdns] http://claude-rlcd.local/`.
+Then, from WSL:
+
+```bash
+# listen only (does not disturb a running board)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\path\listen.ps1' -Port COM3
+
+# reset the board and capture the boot log from the first line
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\path\listen.ps1' -Port COM3 -Reset
+```
+
+`-Reset` pulses RTS, which drives EN low and reboots the board; with DTR held
+false it boots the application normally rather than into the bootloader.
+
+A healthy boot ends with:
+
+```
+[boot] Claude RLCD notifier
+[boot] LCD ok
+[boot] BOOT painted
+[wifi] ip=192.168.1.42
+[mdns] http://claude-rlcd.local/
+[boot] READY
+```
+
+If instead you see `STA Disconnected: SSID: <name>, Reason: 201 - NO_AP_FOUND`
+followed by `[wifi] portal open`, the board cannot see that network. The usual
+cause is a 5GHz SSID; see the warning in *Quick start*.
 
 ### Manual install (skipping `install.sh`)
 
 ```bash
 cp notify-esp32.sh ~/.claude/notify-esp32.sh
 chmod +x ~/.claude/notify-esp32.sh
-echo claude-rlcd.local > ~/.claude/esp32-ip      # or the IP
+echo 192.168.1.42      > ~/.claude/esp32-ip      # the board's IP, from its screen.
+                                                 # Prefer a literal IP over
+                                                 # claude-rlcd.local: hooks run on
+                                                 # every prompt and mDNS costs
+                                                 # ~1.4s a call. The script falls
+                                                 # back to the name if this dies.
 echo 20030102          > ~/.claude/esp32-token   # pairing token from the sticker
 chmod 600                ~/.claude/esp32-token
 # then hand-merge settings-snippet.json's "hooks" block into ~/.claude/settings.json
@@ -571,31 +922,34 @@ chmod +x ~/.claude/notify-esp32-codex.sh
 ```
 
 ```toml
-# in config.toml. Drop the "wsl.exe -e " prefix if Codex runs on the same OS
-# as the script (native Linux/macOS rather than Windows-over-WSL).
+# in config.toml. Two forms, one per install:
+#   native Linux/macOS/WSL Codex -> '/home/you/.claude/notify-esp32-codex.sh working'
+#   Codex on Windows             -> 'wsl.exe -e /home/you/.claude/... working win'
+# The trailing "win" tags the cell (Codex W) and makes the script run
+# synchronously, which a wsl.exe-bridged hook requires.
 [[hooks.UserPromptSubmit]]
 matcher = ""
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh working'
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh working win'
 
 [[hooks.Stop]]
 matcher = ""
 [[hooks.Stop.hooks]]
 type = "command"
-command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh done'
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh done win'
 
 [[hooks.PermissionRequest]]
 matcher = ""
 [[hooks.PermissionRequest.hooks]]
 type = "command"
-command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh action'
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh action win'
 
 [[hooks.PreToolUse]]
 matcher = ""
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh clear'
+command = 'wsl.exe -e /home/you/.claude/notify-esp32-codex.sh clear win'
 ```
 
 `notify-esp32-codex.sh` needs only `python3` and `curl` (no `ccusage`). It
@@ -605,8 +959,25 @@ reads the same `~/.claude/esp32-ip` and `~/.claude/esp32-token` files.
 
 - **Screen blank after upload** — wrong panel driver or pin map. This board
   needs `ST7305_U8g2` (vendored) with the pins above; GxEPD2 won't drive it.
-- **`Serial.println` silent** — known: HardwareSerial USB CDC isn't wired out
-  on this board. Use `esp_rom_printf` instead.
+- **`Serial.println` silent** — expected. `platformio.ini` sets
+  `-DARDUINO_USB_CDC_ON_BOOT=0`, so `Serial` is UART0 on GPIO43/44, which is
+  not wired to the USB-C socket. Use `esp_rom_printf`, which reaches the ROM
+  console on the native USB-Serial/JTAG interface.
+- **Device IP changed on its own** — normal DHCP lease churn, and more likely
+  if your WiFi has several APs broadcasting one SSID. `~/.claude/esp32-ip`
+  should hold a **literal IP**, not `claude-rlcd.local`: hooks fire on every
+  prompt and tool call, and mDNS resolution from WSL2 costs 1.2-1.6s each time
+  against a device that answers in about 0.17s. Storing the name is also why
+  hooks used to drop updates silently and strand a cell on screen — a failed
+  lookup returns curl rc=6 and the hook exits without reaching the device.
+  You do not have to maintain this by hand: if the cached IP stops answering,
+  the notifier retries once over mDNS and rewrites the file with the board's
+  new address, so a lease change costs one slow hook and then self-heals.
+- **Hooks report success but the screen never updates** — the hook ran
+  something that exited 0 without reaching the device. On Windows this is
+  almost always the `cmd.exe /c` wrapping trap; see *Claude Code desktop
+  (Windows)*. Confirm the device is reachable independently with
+  `curl http://claude-rlcd.local/`.
 - **mDNS (`claude-rlcd.local`) doesn't resolve from WSL2** — expected; WSL2 has
   no Avahi by default. `install.sh` falls back to asking for the IP, which the
   device prints in the top-right of the screen.
@@ -621,5 +992,15 @@ reads the same `~/.claude/esp32-ip` and `~/.claude/esp32-token` files.
   LCD: `curl http://<host>/show-token`.
 - **Forgot the pairing token entirely** — `curl http://<host>/show-token`
   flashes it on the LCD for 5s (unauthenticated; you need physical
-  line-of-sight). If even the device is lost, re-flash the firmware to wipe
-  the NVS and pair fresh.
+  line-of-sight), or tap the KEY button, which does the same with no network
+  at all. If you cannot see the screen either, hold KEY for 15s to factory
+  reset (clears the token and the WiFi credentials, then reboots).
+
+  Note that **re-flashing the firmware does not clear the token**. NVS lives
+  at `0x9000` outside the application image and survives an upload, which is
+  also why the board rejoins its old WiFi after a re-flash. To wipe it from a
+  host, erase the chip explicitly:
+
+  ```bash
+  python "$ESPTOOL" --port COM3 erase_flash   # destroys WiFi creds + token + app
+  ```
