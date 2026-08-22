@@ -475,13 +475,21 @@ static void installRelease() {
   mbedtls_sha256_init(&ctx); mbedtls_sha256_starts_ret(&ctx, 0);
   WiFiClient* stream = http.getStreamPtr();
   uint8_t buf[2048]; int written = 0;
+  uint32_t lastProgressMs = millis();
   while (http.connected() && written < total) {
     int n = stream->available();
-    if (!n) { delay(2); continue; }
+    if (!n) {
+      // A connected socket can remain silent forever. Abort if no firmware
+      // bytes arrive for 20 seconds; the active OTA slot remains untouched.
+      if ((uint32_t)(millis() - lastProgressMs) > 20000UL) break;
+      delay(2);
+      continue;
+    }
     if (n > (int)sizeof(buf)) n = sizeof(buf);
     n = stream->readBytes(buf, n);
     if (n <= 0 || Update.write(buf, n) != (size_t)n) break;
     mbedtls_sha256_update_ret(&ctx, buf, n); written += n;
+    lastProgressMs = millis();
   }
   unsigned char digest[32]; char hex[65];
   mbedtls_sha256_finish_ret(&ctx, digest); mbedtls_sha256_free(&ctx);
@@ -915,6 +923,23 @@ static void renderKeyHint(uint32_t heldMs) {
   u8g2->setDrawColor(BG_COLOR);
   u8g2->drawBox(0, 0, LCD_W, LCD_H);
   u8g2->setDrawColor(FG_COLOR);
+
+  // While an update offer is visible, holding KEY means dismiss, not clear
+  // cells. Keep the 15-second factory-reset escape hatch unchanged.
+  if (g_releaseAvailable && !g_releaseDismissed) {
+    u8g2->setFont(u8g2_font_helvB14_tr);
+    u8g2->drawStr(40, 60, "Update options");
+    u8g2->setFont(u8g2_font_6x13_tf);
+    u8g2->drawStr(40, 110, "Release now: dismiss this update");
+    u8g2->drawStr(40, 135, "It will be offered again tomorrow");
+    u8g2->drawStr(40, 175, "Hold 15s total: FACTORY RESET");
+    int barW = (int)((uint64_t)heldMs * (LCD_W - 80) / 15000);
+    if (barW > LCD_W - 80) barW = LCD_W - 80;
+    u8g2->drawFrame(40, 220, LCD_W - 80, 16);
+    u8g2->drawBox(40, 220, barW, 16);
+    u8g2->sendBuffer();
+    return;
+  }
   u8g2->setFont(u8g2_font_helvB14_tr);
   if (heldMs < 5000) {
     u8g2->drawStr(40, 60, "Holding KEY...");
@@ -977,7 +1002,7 @@ static void handleKey() {
         } else {
           g_tapArmedUntilMs = now + TAP_DOUBLE_MS;
         }
-      } else if (g_releaseAvailable && !g_releaseDismissed && held < 5000) {
+      } else if (g_releaseAvailable && !g_releaseDismissed && held < 15000) {
         g_releaseDismissed = true;
         esp_rom_printf("[update] dismissed until next check\n");
       } else if (g_keyTier == 1) {
