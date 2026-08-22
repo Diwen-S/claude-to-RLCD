@@ -14,6 +14,8 @@
 //   GET /show-token                              flash token on LCD (unauth)
 //   GET /reset-wifi                              wipe wifi creds, reopen portal
 //   GET /quote-tour                              cycle every quote 5s for QA
+//   GET /update?t=<token>                        authenticated firmware upload form
+//   POST /update?t=<token>                       install firmware into inactive OTA slot
 //
 // Multi-source: each `src` value gets its own cell in a grid that adapts to
 // the count. Cells display a small label, a big status word, and an alert
@@ -28,12 +30,24 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <Update.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/sha256.h>
 #include <time.h>
 #include <esp_rom_sys.h>
 #include "ST7305_U8g2.h"
+#include "update_public_key.h"
 
 #define AP_SSID  "Claude-RLCD-Setup"
 #define MDNS_HOST "claude-rlcd"
+#define UPDATE_MANIFEST_URL "https://github.com/Diwen-S/claude-to-RLCD/releases/latest/download/latest.json"
+
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "dev"
+#endif
 
 static Preferences g_prefs;
 static String      g_token = "";   // empty = open mode (awaiting first /pair call)
@@ -57,6 +71,17 @@ static ST7305_U8g2 lcd(RLCD_SCK_PIN, RLCD_MOSI_PIN, RLCD_DC_PIN, RLCD_CS_PIN, RL
 static U8G2* u8g2 = nullptr;
 
 WebServer server(80);
+static bool g_updateAuthorized = false;
+static bool g_updateFailed = false;
+static bool g_releaseAvailable = false;
+static bool g_releaseDismissed = false;
+static bool g_releaseInstalling = false;
+static String g_releaseVersion;
+static String g_releaseUrl;
+static String g_releaseSha;
+static uint32_t g_lastReleaseCheckMs = 0;
+static const uint32_t RELEASE_CHECK_MS = 24UL * 60UL * 60UL * 1000UL;
+static void render();
 
 struct Source {
   String   id;       // short label, e.g. "Ubuntu (Code)"
@@ -342,7 +367,182 @@ static void renderBottomStrip() {
   u8g2->drawStr(LCD_W - iw - 20, 286, INSCRIPTION);
 }
 
+static String jsonString(const String& json, const char* key) {
+  String needle = String("\"") + key + "\"";
+  int p = json.indexOf(needle);
+  if (p < 0) return "";
+  p = json.indexOf(':', p + needle.length());
+  if (p < 0) return "";
+  p = json.indexOf('"', p + 1);
+  if (p < 0) return "";
+  int q = json.indexOf('"', p + 1);
+  if (q < 0) return "";
+  return json.substring(p + 1, q);
+}
+
+static bool newerVersion(const String& candidate) {
+  int a=0,b=0,c=0,x=0,y=0,z=0;
+  if (sscanf(candidate.c_str(), "%d.%d.%d", &a, &b, &c) != 3) return false;
+  if (sscanf(FIRMWARE_VERSION, "%d.%d.%d", &x, &y, &z) != 3) return false;
+  return a != x ? a > x : (b != y ? b > y : c > z);
+}
+
+static bool verifyReleaseSignature(const String& version, const String& url,
+                                   const String& sha, const String& signature) {
+  String canonical = version + "\n" + url + "\n" + sha + "\n";
+  unsigned char digest[32];
+  mbedtls_sha256_ret((const unsigned char*)canonical.c_str(), canonical.length(), digest, 0);
+
+  size_t sigLen = 0;
+  unsigned char sig[96];
+  if (mbedtls_base64_decode(sig, sizeof(sig), &sigLen,
+      (const unsigned char*)signature.c_str(), signature.length()) != 0) return false;
+
+  mbedtls_pk_context key;
+  mbedtls_pk_init(&key);
+  int rc = mbedtls_pk_parse_public_key(&key, (const unsigned char*)UPDATE_PUBLIC_KEY,
+                                       strlen(UPDATE_PUBLIC_KEY) + 1);
+  if (rc == 0) rc = mbedtls_pk_verify(&key, MBEDTLS_MD_SHA256, digest, sizeof(digest), sig, sigLen);
+  mbedtls_pk_free(&key);
+  return rc == 0;
+}
+
+static void renderReleaseScreen(const char* title, const char* line1, const char* line2) {
+  u8g2->clearBuffer();
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawBox(0, 0, LCD_W, LCD_H);
+  u8g2->setDrawColor(FG_COLOR);
+  drawClaudeBurst(55, 55, 38);
+  u8g2->setFont(u8g2_font_helvB14_tr);
+  u8g2->drawStr(120, 48, title);
+  u8g2->drawHLine(20, 100, 360);
+  u8g2->setFont(u8g2_font_helvB12_tr);
+  u8g2->drawStr(30, 145, line1);
+  u8g2->setFont(u8g2_font_6x13_tf);
+  u8g2->drawStr(30, 180, line2);
+  u8g2->sendBuffer();
+}
+
+static void checkForRelease() {
+  if (!g_token.length() || WiFi.status() != WL_CONNECTED || g_releaseInstalling) return;
+  g_lastReleaseCheckMs = millis();
+  WiFiClientSecure tls;
+  tls.setInsecure(); // Authenticity comes from the offline ECDSA signature.
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(12000);
+  if (!http.begin(tls, UPDATE_MANIFEST_URL) || http.GET() != HTTP_CODE_OK) {
+    esp_rom_printf("[update] manifest unavailable\n");
+    http.end();
+    return;
+  }
+  String json = http.getString();
+  http.end();
+  String v = jsonString(json, "version");
+  String u = jsonString(json, "url");
+  String h = jsonString(json, "sha256");
+  String s = jsonString(json, "signature");
+  h.toLowerCase();
+  if (v.length() > 15 || !u.startsWith("https://") || h.length() != 64 ||
+      !verifyReleaseSignature(v, u, h, s)) {
+    esp_rom_printf("[update] rejected unsigned/invalid manifest\n");
+    return;
+  }
+  if (newerVersion(v)) {
+    g_releaseVersion = v; g_releaseUrl = u; g_releaseSha = h;
+    g_releaseAvailable = true; g_releaseDismissed = false;
+    render();
+  }
+}
+
+static void installRelease() {
+  g_releaseInstalling = true;
+  renderReleaseScreen("Installing update", "Please wait", "Keep the device powered on");
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
+  int code = http.begin(tls, g_releaseUrl) ? http.GET() : -1;
+  int total = http.getSize();
+  if (code != HTTP_CODE_OK || total <= 0 || !Update.begin(total, U_FLASH)) {
+    http.end(); g_releaseInstalling = false;
+    renderReleaseScreen("Update failed", "Nothing was changed", "It will try again later");
+    delay(3500); render(); return;
+  }
+
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx); mbedtls_sha256_starts_ret(&ctx, 0);
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buf[2048]; int written = 0;
+  while (http.connected() && written < total) {
+    int n = stream->available();
+    if (!n) { delay(2); continue; }
+    if (n > (int)sizeof(buf)) n = sizeof(buf);
+    n = stream->readBytes(buf, n);
+    if (n <= 0 || Update.write(buf, n) != (size_t)n) break;
+    mbedtls_sha256_update_ret(&ctx, buf, n); written += n;
+  }
+  unsigned char digest[32]; char hex[65];
+  mbedtls_sha256_finish_ret(&ctx, digest); mbedtls_sha256_free(&ctx);
+  for (int i=0;i<32;i++) sprintf(hex + i*2, "%02x", digest[i]); hex[64]=0;
+  http.end();
+  if (written != total || g_releaseSha != String(hex) || !Update.end(true)) {
+    Update.abort(); g_releaseInstalling = false;
+    renderReleaseScreen("Update failed", "Verification failed", "The old version is still safe");
+    delay(4000); render(); return;
+  }
+  renderReleaseScreen("Update complete", "Restarting now", g_releaseVersion.c_str());
+  delay(1200); ESP.restart();
+}
+
+// Full-screen hand-off shown after WiFi succeeds but before the computer-side
+// installer pairs the device. Keep this self-contained: a recipient should be
+// able to continue without reading the README or understanding the firmware.
+static void renderFirstRunScreen() {
+  u8g2->clearBuffer();
+  u8g2->setDrawColor(BG_COLOR);
+  u8g2->drawBox(0, 0, LCD_W, LCD_H);
+  u8g2->setDrawColor(FG_COLOR);
+
+  drawClaudeBurst(50, 48, 30);
+
+  u8g2->setFont(u8g2_font_helvB14_tr);
+  u8g2->drawStr(100, 42, "Almost ready");
+  u8g2->setFont(u8g2_font_6x13_tf);
+  u8g2->drawStr(100, 67, "Finish setup on your computer");
+
+  u8g2->drawHLine(20, 88, 360);
+
+  u8g2->drawStr(30, 118, "1. Open the claude-to-RLCD folder");
+  u8g2->drawStr(30, 143, "2. Open Terminal in that folder");
+  u8g2->drawStr(30, 168, "3. Run this command:");
+
+  String command = "./install.sh";
+  u8g2->setFont(u8g2_font_helvB12_tr);
+  int cw = u8g2->getStrWidth(command.c_str());
+  u8g2->drawFrame(20, 183, 360, 42);
+  u8g2->drawStr((LCD_W - cw) / 2, 211, command.c_str());
+
+  u8g2->setFont(u8g2_font_6x13_tf);
+  u8g2->drawStr(30, 252, "4. Follow the questions on screen");
+  u8g2->setFont(u8g2_font_5x7_tf);
+  u8g2->drawStr(30, 278, "Keep this screen nearby during setup");
+
+  u8g2->sendBuffer();
+}
+
 static void renderMainView() {
+  if (g_releaseAvailable && !g_releaseDismissed) {
+    String title = "Update " + g_releaseVersion + " available";
+    renderReleaseScreen(title.c_str(), "Tap KEY to install", "Hold KEY 1 second to dismiss");
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED && g_token.length() == 0) {
+    renderFirstRunScreen();
+    return;
+  }
+
   u8g2->clearBuffer();
   u8g2->setDrawColor(BG_COLOR);
   u8g2->drawBox(0, 0, LCD_W, LCD_H);
@@ -382,14 +582,6 @@ static void renderMainView() {
   u8g2->drawHLine(20, 102, 360);
 
   renderGrid();
-
-  // Pair hint as a subtitle under the big status word, while unpaired.
-  if (g_token.length() == 0) {
-    u8g2->setFont(u8g2_font_6x13_tf);
-    const char* hint = "PAIR ME via ./install.sh in /claude-to-RLCD";
-    int hw = u8g2->getStrWidth(hint);
-    u8g2->drawStr((LCD_W - hw) / 2, 218, hint);
-  }
 
   renderBottomStrip();
 
@@ -548,33 +740,34 @@ static void renderPortalScreen(const String& apIp) {
   drawClaudeBurst(55, 55, 38);
 
   u8g2->setFont(u8g2_font_helvB14_tr);
-  u8g2->drawStr(120, 45, "WiFi setup needed");
+  u8g2->drawStr(120, 45, "Connect to Wi-Fi");
 
   u8g2->setFont(u8g2_font_6x13_tf);
-  u8g2->drawStr(120, 72, "From your phone, join:");
+  u8g2->drawStr(120, 72, "On your phone, join:");
   u8g2->setFont(u8g2_font_helvB14_tr);
   u8g2->drawStr(120, 92, AP_SSID);
 
   u8g2->drawHLine(20, 115, 360);
 
   u8g2->setFont(u8g2_font_6x13_tf);
-  u8g2->drawStr(30, 145, "1. Open WiFi settings on phone");
+  u8g2->drawStr(30, 145, "1. Open your phone's Wi-Fi settings");
   u8g2->drawStr(30, 165, "2. Join " AP_SSID);
-  u8g2->drawStr(30, 185, "3. Browser opens; pick your WiFi");
-  u8g2->drawStr(30, 205, "4. Device reboots and shows IP");
+  u8g2->drawStr(30, 185, "3. Choose home Wi-Fi (2.4 GHz, not 5G)");
+  u8g2->drawStr(30, 205, "4. Enter its password and tap Save");
 
   u8g2->drawHLine(20, 225, 360);
 
   u8g2->setFont(u8g2_font_5x7_tf);
-  String hint = "Portal IP: " + apIp + "  (auto-opens on most phones)";
-  u8g2->drawStr(30, 250, hint.c_str());
-  u8g2->drawStr(30, 270, "Reach later at: http://" MDNS_HOST ".local/");
+  u8g2->drawStr(30, 250, "The setup page should open automatically");
+  String hint = "If it does not, open http://" + apIp;
+  u8g2->drawStr(30, 270, hint.c_str());
 
   u8g2->sendBuffer();
 }
 
 static void handleRoot() {
   String s = "Claude RLCD notifier\n";
+  s += "firmware = " FIRMWARE_VERSION "\n";
   s += "sources = " + String(g_nsrc) + "\n";
   for (int i = 0; i < g_nsrc; i++) {
     s += "  [" + g_src[i].id + "] status=" + g_src[i].status;
@@ -598,6 +791,84 @@ static void handleRoot() {
   s += "ip     = " + WiFi.localIP().toString() + "\n";
   s += "paired = " + String(g_token.length() ? "yes" : "no (open mode — call /pair)") + "\n";
   server.send(200, "text/plain", s);
+}
+
+// Browser-driven A/B update. Firmware is written only to the inactive OTA
+// slot; Update.end(true) validates the complete ESP image before selecting it
+// for the next boot. Unlike ordinary write endpoints, updating is disabled in
+// open mode: a firmware upload must never be the action that claims a device.
+static void handleUpdateForm() {
+  if (g_token.length() == 0) {
+    server.send(409, "text/plain", "pair the device before installing firmware\n");
+    return;
+  }
+  if (!authorized()) {
+    server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n");
+    return;
+  }
+
+  String html =
+    "<!doctype html><meta name=viewport content='width=device-width'>"
+    "<title>Claude RLCD update</title>"
+    "<h1>Claude RLCD firmware update</h1><p>Installed: " FIRMWARE_VERSION "</p>"
+    "<p>Select a firmware.bin built from this project. The device reboots only "
+    "after the complete ESP32 image passes validation.</p>"
+    "<form method=POST enctype='multipart/form-data' action='/update?t=";
+  html += g_token;
+  html += "'><input type=file name=firmware accept='.bin,application/octet-stream' required> "
+          "<button type=submit>Install update</button></form>";
+  server.send(200, "text/html", html);
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    g_updateAuthorized = g_token.length() != 0 && authorized();
+    g_updateFailed = !g_updateAuthorized;
+    if (!g_updateAuthorized) return;
+
+    esp_rom_printf("[ota] receiving %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      g_updateFailed = true;
+      Update.printError(Serial);
+      esp_rom_printf("[ota] begin failed, error=%u\n", Update.getError());
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!g_updateAuthorized || g_updateFailed) return;
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      g_updateFailed = true;
+      esp_rom_printf("[ota] write failed, error=%u\n", Update.getError());
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!g_updateAuthorized || g_updateFailed) return;
+    if (!Update.end(true)) {
+      g_updateFailed = true;
+      esp_rom_printf("[ota] validation failed, error=%u\n", Update.getError());
+    } else {
+      esp_rom_printf("[ota] accepted %u bytes\n", upload.totalSize);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    g_updateFailed = true;
+    Update.abort();
+    esp_rom_printf("[ota] upload aborted\n");
+  }
+}
+
+static void handleUpdateFinished() {
+  if (!g_updateAuthorized) {
+    server.send(403, "text/plain", "forbidden: pair first and supply the correct ?t=<token>\n");
+    return;
+  }
+  if (g_updateFailed || Update.hasError()) {
+    server.send(400, "text/plain", "update rejected; existing firmware remains active\n");
+    return;
+  }
+
+  server.send(200, "text/plain", "update installed; rebooting\n");
+  server.client().flush();
+  delay(500);
+  ESP.restart();
 }
 
 static void handleNotify() {
@@ -686,6 +957,11 @@ static void handleKey() {
       uint32_t held = now - g_keyDownMs;
       g_keyDownMs = 0;
       if (held < 1000) {
+        if (g_releaseAvailable && !g_releaseDismissed) {
+          g_tapArmedUntilMs = 0;
+          installRelease();
+          return;
+        }
         // Single tap = toggle main↔todo view (persistent). Double tap = show
         // pairing token for 5s. The first release arms a window; if a second
         // release lands inside it we've seen a double; otherwise the loop
@@ -701,6 +977,9 @@ static void handleKey() {
         } else {
           g_tapArmedUntilMs = now + TAP_DOUBLE_MS;
         }
+      } else if (g_releaseAvailable && !g_releaseDismissed && held < 5000) {
+        g_releaseDismissed = true;
+        esp_rom_printf("[update] dismissed until next check\n");
       } else if (g_keyTier == 1) {
         g_nsrc = 0;
         esp_rom_printf("[key] cleared all source cells\n");
@@ -789,6 +1068,8 @@ void setup() {
 
   server.on("/",       handleRoot);
   server.on("/notify", handleNotify);
+  server.on("/update", HTTP_GET, handleUpdateForm);
+  server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
 
   // Pair / re-pair. In open mode anyone on LAN can pair; once paired, the
   // existing token is required to change it. ?token=NEWVAL sets a new token.
@@ -913,11 +1194,18 @@ void setup() {
 
   render();
   esp_rom_printf("[boot] READY\n");
+
+  // Check shortly after startup. Failure is silent and retried on schedule.
+  g_lastReleaseCheckMs = millis() - RELEASE_CHECK_MS + 30000;
 }
 
 void loop() {
   server.handleClient();
   handleKey();
+
+  if (!g_releaseInstalling && (uint32_t)(millis() - g_lastReleaseCheckMs) >= RELEASE_CHECK_MS) {
+    checkForRelease();
+  }
 
   // Auto-dismiss the token overlay once its 5s window expires, returning to
   // whichever view (main or todo) the user had toggled to. Done in loop()

@@ -801,6 +801,55 @@ unaffected either way.
 You only need this if you're building or modifying the firmware yourself.
 Recipients of a pre-flashed board do not.
 
+#### Updating over WiFi
+
+Firmware 1.0.0 introduces an A/B OTA layout and a token-protected browser
+uploader. The **first** installation of this version must still use USB and
+PlatformIO, because the flash also needs the new partition table. After that,
+future firmware updates can be installed without a cable:
+
+1. Build with PlatformIO. The uploadable image is
+   `.pio/build/esp32s3-eink/firmware.bin`.
+2. Open `http://claude-rlcd.local/update?t=PAIRING_TOKEN` on the same LAN.
+3. Select `firmware.bin` and install it. The device writes the inactive OTA
+   slot, validates the complete ESP image, and only then reboots into it.
+
+The update endpoint is deliberately unavailable while the device is in open
+(unpaired) mode. A rejected or interrupted upload leaves the running slot
+untouched. WiFi credentials and the pairing token live in NVS at `0x9000`,
+outside both application slots, so normal OTA updates preserve them.
+
+The current endpoint is the recovery-safe OTA foundation, not unattended
+Internet updating. Do not publish an automatic release poller until release
+artifacts have cryptographic signature verification; HTTPS or a checksum
+listed beside the binary is not, by itself, firmware authenticity.
+
+#### Ask-first automatic updates
+
+Firmware 1.1.0 checks the latest GitHub Release once daily after the device is
+paired. A newer release is offered on the LCD and is never installed silently:
+
+- tap **KEY** to install;
+- hold **KEY** for 1 second to dismiss it until the next check.
+
+The release carries `latest.json` and `firmware.bin`. The manifest contains the
+version, download URL, SHA-256 digest, and an ECDSA P-256 signature. The board
+verifies the manifest with the embedded public key, downloads into the inactive
+OTA slot, verifies the complete image digest, and only then selects it for the
+next boot. A failed or interrupted check leaves the running firmware untouched.
+
+Create a signed manifest locally with:
+
+```bash
+tools/make-release-manifest.sh 1.1.0 .pio/build/esp32s3-eink/firmware.bin \
+  https://github.com/Diwen-S/claude-to-RLCD/releases/download/v1.1.0/firmware.bin \
+  > latest.json
+```
+
+The signing key defaults to
+`~/.config/claude-rlcd/firmware-signing-key.pem`; keep it offline and never
+commit it. The public key in `src/update_public_key.h` is safe to publish.
+
 **In Windows VS Code with the PlatformIO IDE extension**: open this folder and
 click PlatformIO **Upload** (→).
 
