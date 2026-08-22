@@ -526,7 +526,7 @@ static void renderFirstRunScreen() {
   u8g2->drawStr(30, 143, "2. Open Terminal in that folder");
   u8g2->drawStr(30, 168, "3. Run this command:");
 
-  String command = "./install.sh";
+  String command = "./install.sh " + WiFi.localIP().toString();
   u8g2->setFont(u8g2_font_helvB12_tr);
   int cw = u8g2->getStrWidth(command.c_str());
   u8g2->drawFrame(20, 183, 360, 42);
