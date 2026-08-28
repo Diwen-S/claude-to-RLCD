@@ -4,14 +4,14 @@
 // WiFi is provisioned via WiFiManager (captive portal "Claude-RLCD-Setup").
 // Reachable at http://claude-rlcd.local/ once joined.
 //
-// HTTP endpoints (write endpoints require ?t=<token> once /pair has been called):
+// HTTP endpoints (write endpoints require the board-generated ?t=<code>):
 //   GET /                              status dump (incl. ip + paired y/n)
 //   GET /notify?src=&status=&ts=&alert=&sp=&r=&wc=    update a source cell
 //   GET /forget?src=  | /forget?all=1            clear source cell(s)
 //   POST /todo?items=<lines>&date=<header>       replace today's calendar list (see handler for line format)
-//   GET /pair?token=<4-32 alnum>                 set/rotate the pairing token
-//   GET /unpair                                  clear token, back to open mode
-//   GET /show-token                              flash token on LCD (unauth)
+//   GET /pair?token=<4 digits>                   claim using the code on screen
+//   GET /unpair                                  generate a new code, return to setup
+//   GET /show-token                              flash pairing code on LCD (unauth)
 //   GET /reset-wifi                              wipe wifi creds, reopen portal
 //   GET /quote-tour                              cycle every quote 5s for QA
 //   GET /update?t=<token>                        authenticated firmware upload form
@@ -37,6 +37,7 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 #include <time.h>
+#include <esp_system.h>
 #include <esp_rom_sys.h>
 #include "ST7305_U8g2.h"
 #include "update_public_key.h"
@@ -50,7 +51,8 @@
 #endif
 
 static Preferences g_prefs;
-static String      g_token = "";   // empty = open mode (awaiting first /pair call)
+static String      g_token = "";   // board-generated four-digit pairing code
+static bool        g_claimed = false;
 
 // Pin map from Waveshare ESP32-S3-RLCD-4.2 official examples
 #define RLCD_SCK_PIN   11
@@ -114,7 +116,7 @@ enum ViewMode { VIEW_MAIN, VIEW_TODO };
 static ViewMode g_view = VIEW_MAIN;
 
 // Overlay = transient takeover that auto-dismisses back to the current view.
-// Used by double-tap → pairing token. Kept non-blocking (no delay()) so the
+// Used by double-tap to show the pairing code. Kept non-blocking (no delay()) so the
 // KEY handler can fire again before the overlay expires.
 enum OverlayMode  { OVL_NONE, OVL_TOKEN };
 static OverlayMode g_overlay        = OVL_NONE;
@@ -424,7 +426,7 @@ static void renderReleaseScreen(const char* title, const char* line1, const char
 }
 
 static void checkForRelease() {
-  if (!g_token.length() || WiFi.status() != WL_CONNECTED || g_releaseInstalling) return;
+  if (!g_claimed || WiFi.status() != WL_CONNECTED || g_releaseInstalling) return;
   g_lastReleaseCheckMs = millis();
   WiFiClientSecure tls;
   tls.setInsecure(); // Authenticity comes from the offline ECDSA signature.
@@ -517,8 +519,9 @@ static void renderFirstRunScreen() {
 
   u8g2->setFont(u8g2_font_helvB14_tr);
   u8g2->drawStr(100, 42, "Almost ready");
-  u8g2->setFont(u8g2_font_6x13_tf);
-  u8g2->drawStr(100, 67, "Finish setup on your computer");
+  u8g2->setFont(u8g2_font_helvB12_tr);
+  String codeLine = "Pairing code: " + g_token;
+  u8g2->drawStr(100, 70, codeLine.c_str());
 
   u8g2->drawHLine(20, 88, 360);
 
@@ -533,7 +536,7 @@ static void renderFirstRunScreen() {
   u8g2->drawStr((LCD_W - cw) / 2, 211, command.c_str());
 
   u8g2->setFont(u8g2_font_6x13_tf);
-  u8g2->drawStr(30, 252, "4. Follow the questions on screen");
+  u8g2->drawStr(30, 252, "4. Enter the pairing code shown above");
   u8g2->setFont(u8g2_font_5x7_tf);
   u8g2->drawStr(30, 278, "Keep this screen nearby during setup");
 
@@ -546,7 +549,7 @@ static void renderMainView() {
     renderReleaseScreen(title.c_str(), "Tap KEY to install", "Hold KEY 1 second to dismiss");
     return;
   }
-  if (WiFi.status() == WL_CONNECTED && g_token.length() == 0) {
+  if (WiFi.status() == WL_CONNECTED && !g_claimed) {
     renderFirstRunScreen();
     return;
   }
@@ -596,33 +599,33 @@ static void renderMainView() {
   u8g2->sendBuffer();
 }
 
-// Validate the ?t=... query arg against the saved token.
-// When no token is saved (open mode), accept anything — covers the
-// freshly-flashed / just-unpaired state until the first /pair call.
+// Validate the ?t=... query arg against the board-generated code.
 static bool authorized() {
-  if (g_token.length() == 0) return true;
   if (!server.hasArg("t")) return false;
   return server.arg("t") == g_token;
 }
 
-// Tokens must be 4–32 chars, alphanumeric only (keeps URL-encoding trivial).
 static bool validTokenShape(const String& t) {
-  if (t.length() < 4 || t.length() > 32) return false;
+  if (t.length() != 4) return false;
   for (size_t i = 0; i < t.length(); i++) {
     char c = t.charAt(i);
-    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
+    if (!(c >= '0' && c <= '9')) return false;
   }
   return true;
 }
 
-// Briefly flash the current token on the LCD for visual recovery.
+static String generatePairingCode() {
+  return String(1000 + (esp_random() % 9000));
+}
+
+// Briefly flash the current pairing code on the LCD for visual recovery.
 static void renderTokenBanner(const String& tok) {
   u8g2->clearBuffer();
   u8g2->setDrawColor(BG_COLOR);
   u8g2->drawBox(0, 0, LCD_W, LCD_H);
   u8g2->setDrawColor(FG_COLOR);
   u8g2->setFont(u8g2_font_helvB14_tr);
-  const char* label = "Pairing token";
+  const char* label = "Pairing code";
   int lw = u8g2->getStrWidth(label);
   u8g2->drawStr((LCD_W - lw) / 2, 100, label);
   u8g2->setFont(u8g2_font_osb29_tr);
@@ -797,7 +800,7 @@ static void handleRoot() {
     s += "         " + g_todo[i] + "\n";
   }
   s += "ip     = " + WiFi.localIP().toString() + "\n";
-  s += "paired = " + String(g_token.length() ? "yes" : "no (open mode — call /pair)") + "\n";
+  s += "paired = " + String(g_claimed ? "yes" : "no (enter code shown on board)") + "\n";
   server.send(200, "text/plain", s);
 }
 
@@ -806,7 +809,7 @@ static void handleRoot() {
 // for the next boot. Unlike ordinary write endpoints, updating is disabled in
 // open mode: a firmware upload must never be the action that claims a device.
 static void handleUpdateForm() {
-  if (g_token.length() == 0) {
+  if (!g_claimed) {
     server.send(409, "text/plain", "pair the device before installing firmware\n");
     return;
   }
@@ -832,7 +835,7 @@ static void handleUpdateUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
-    g_updateAuthorized = g_token.length() != 0 && authorized();
+    g_updateAuthorized = g_claimed && authorized();
     g_updateFailed = !g_updateAuthorized;
     if (!g_updateAuthorized) return;
 
@@ -904,9 +907,9 @@ static void handleNotify() {
 // ---- KEY button handler -----------------------------------------------------
 // Gestures (no laptop / no network needed):
 //   single tap:     toggle main Claude view ↔ calendar view (both persist; no auto-revert)
-//   double tap:     flash pairing token on the LCD for 5s, then back to the active view
+//   double tap:     flash pairing code on the LCD for 5s, then back to the active view
 //   hold 5s:        clear all source cells (= /forget?all=1)
-//   hold 15s:       factory reset — wipe WiFi creds + token, reboot into portal
+//   hold 15s:       factory reset, wipe WiFi and code, reboot into portal
 // Tap timing: the first short release arms a ~350ms window. A second release
 // inside that window fires double-tap; expiry fires single-tap. The slight
 // latency on single-tap is the cost of unambiguous single/double detection.
@@ -957,7 +960,7 @@ static void renderKeyHint(uint32_t heldMs) {
     u8g2->setFont(u8g2_font_6x13_tf);
     u8g2->drawStr(40, 110, "Release now: clears all source cells");
     u8g2->drawStr(40, 135, "Hold 15s total: FACTORY RESET");
-    u8g2->drawStr(40, 160, "(wipes WiFi + pairing token)");
+    u8g2->drawStr(40, 160, "(wipes WiFi + pairing code)");
     int barW = (int)((uint64_t)(heldMs - 5000) * (LCD_W - 80) / 10000);
     u8g2->drawFrame(40, 220, LCD_W - 80, 16);
     u8g2->drawBox(40, 220, barW, 16);
@@ -988,17 +991,15 @@ static void handleKey() {
           return;
         }
         // Single tap = toggle main↔todo view (persistent). Double tap = show
-        // pairing token for 5s. The first release arms a window; if a second
+        // pairing code for 5s. The first release arms a window; if a second
         // release lands inside it we've seen a double; otherwise the loop
         // fires the single after the window expires (so the gestures don't
         // collide).
         if (g_tapArmedUntilMs && (int32_t)(now - g_tapArmedUntilMs) <= 0) {
           g_tapArmedUntilMs = 0;
-          if (g_token.length()) {
-            renderTokenBanner(g_token);
-            g_overlay        = OVL_TOKEN;
-            g_overlayUntilMs = now + 5000;
-          }
+          renderTokenBanner(g_token);
+          g_overlay        = OVL_TOKEN;
+          g_overlayUntilMs = now + 5000;
         } else {
           g_tapArmedUntilMs = now + TAP_DOUBLE_MS;
         }
@@ -1053,7 +1054,13 @@ void setup() {
 
   g_prefs.begin("claude-rlcd", false);
   g_token = g_prefs.getString("token", "");
-  esp_rom_printf("[auth] %s\n", g_token.length() ? "paired" : "OPEN MODE — call /pair?token=...");
+  if (!validTokenShape(g_token)) {
+    g_token = generatePairingCode();
+    g_prefs.putString("token", g_token);
+    g_prefs.putBool("claimed", false);
+  }
+  g_claimed = g_prefs.getBool("claimed", false);
+  esp_rom_printf("[auth] pairing code ready, claimed=%s\n", g_claimed ? "yes" : "no");
 
   lcd.begin(0, U8G2_R1);
   u8g2 = lcd.getU8g2();
@@ -1096,53 +1103,49 @@ void setup() {
   server.on("/update", HTTP_GET, handleUpdateForm);
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
 
-  // Pair / re-pair. In open mode anyone on LAN can pair; once paired, the
-  // existing token is required to change it. ?token=NEWVAL sets a new token.
+  // Claim the board using the four-digit code printed on its screen.
   server.on("/pair", []() {
-    if (g_token.length() != 0 && !authorized()) {
-      server.send(403, "text/plain", "forbidden: device already paired, supply current ?t=<token>\n");
+    if (g_claimed) {
+      server.send(409, "text/plain", "device is already paired\n");
       return;
     }
     if (!server.hasArg("token")) {
-      server.send(400, "text/plain", "usage: /pair?token=<4-32 alnum>[&t=<current-token>]\n");
+      server.send(400, "text/plain", "usage: /pair?token=<4-digit-code>\n");
       return;
     }
     String nt = server.arg("token");
-    if (!validTokenShape(nt)) {
-      server.send(400, "text/plain", "token must be 4-32 alphanumeric chars\n");
+    if (!validTokenShape(nt) || nt != g_token) {
+      server.send(403, "text/plain", "wrong pairing code\n");
       return;
     }
-    g_token = nt;
-    g_prefs.putString("token", g_token);
-    esp_rom_printf("[auth] paired with new token (%d chars)\n", g_token.length());
+    g_claimed = true;
+    g_prefs.putBool("claimed", true);
+    esp_rom_printf("[auth] paired\n");
     renderTokenBanner(g_token);
     delay(2500);
     render();
     server.send(200, "text/plain", "paired ok\n");
   });
 
-  // Flash the current token on the LCD for visual recovery — unauth on
+  // Flash the current pairing code on the LCD for visual recovery, unauth on
   // purpose: needs physical line-of-sight to be useful.
   server.on("/show-token", []() {
-    if (g_token.length() == 0) {
-      server.send(200, "text/plain", "no token set (open mode)\n");
-      return;
-    }
     renderTokenBanner(g_token);
-    server.send(200, "text/plain", "token shown on LCD for ~5s\n");
+    server.send(200, "text/plain", "pairing code shown on LCD for ~5s\n");
     delay(5000);
     render();
   });
 
-  // Clear the saved pairing token — device returns to open mode (any LAN
-  // host can now /pair it). Doesn't touch WiFi creds or source cells.
+  // Unpair without clearing WiFi. Generate a fresh code for the next owner.
   server.on("/unpair", []() {
     if (!authorized()) { server.send(403, "text/plain", "forbidden: missing or wrong ?t=<token>\n"); return; }
-    g_prefs.remove("token");
-    g_token = "";
-    esp_rom_printf("[auth] unpaired — back to open mode\n");
+    g_token = generatePairingCode();
+    g_claimed = false;
+    g_prefs.putString("token", g_token);
+    g_prefs.putBool("claimed", false);
+    esp_rom_printf("[auth] unpaired, generated a new pairing code\n");
     render();
-    server.send(200, "text/plain", "unpaired — device is now in open mode, /pair to re-secure\n");
+    server.send(200, "text/plain", "unpaired; enter the new code shown on the board\n");
   });
 
   server.on("/reset-wifi", []() {

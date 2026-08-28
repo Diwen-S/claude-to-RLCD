@@ -58,15 +58,15 @@ The firmware is already on the board. To set it up on a new WiFi:
    ./install.sh
    ```
    It discovers the ESP at `http://claude-rlcd.local/` (or asks for the IP if
-   mDNS isn't available — common on WSL2), prompts you for the pairing token
-   the gifter wrote on the sticker (e.g. `20030102`), then asks a yes/no
+   mDNS isn't available — common on WSL2), prompts you for the four-digit
+   pairing code shown on the board, then asks a yes/no
    question per agent: **"Set up Claude Code?"**, **"Set up Claude Code
    desktop for Windows?"** (WSL only, see step 6), and **"Set up Codex?"**.
    Answer each to wire that agent; you can pick any combination, or none. For
    Claude it copies the hook script to `~/.claude/` and merges hooks into
    `~/.claude/settings.json` without touching your other settings; for Codex
-   see *Codex support* below. If the gifter forgot the sticker, run `curl
-   http://claude-rlcd.local/show-token` and read the token off the LCD.
+   see *Codex support* below. To display the code again, run `curl
+   http://claude-rlcd.local/show-token` or double-tap KEY.
 5. **Start a new Claude Code (or Codex) session.** The screen flips to
    `WORKING` on your first prompt and `DONE` when the agent finishes.
 
@@ -452,9 +452,9 @@ The on-board KEY button (GPIO18) is the no-laptop, no-network entry point:
 | Gesture | Action |
 |---|---|
 | **Single tap** | Toggle between Claude status view and calendar view. Both persist until tapped again; nothing auto-reverts. |
-| **Double tap** (within ~350ms) | Flash pairing token on the LCD for 5s, then return to whichever view was active. Equivalent to `curl /show-token`. |
+| **Double tap** (within ~350ms) | Flash the four-digit pairing code on the LCD for 5s, then return to whichever view was active. Equivalent to `curl /show-token`. |
 | Hold 5s, release | Clear all source cells. Equivalent to `curl /forget?all=1`. |
-| Hold **15s** | Factory reset — wipes WiFi creds AND pairing token, reboots into the captive portal. |
+| Hold **15s** | Factory reset — wipes WiFi credentials and the pairing code, reboots into the captive portal, and generates a new code. |
 
 Notes:
 
@@ -475,9 +475,9 @@ Notes:
 - **Top-right, two side-by-side blocks** separated by a thin vertical rule:
   - *Usage* (left): `5h XX%   reset HH:MM` and `week $XX`.
   - *Activity* (right): `last HH:MM:SS` and `resp N` (total DONE count).
-- **Below the title strip:** the device IP in small text (`ip 192.168.…`).
-  If the device is unpaired, the IP line also shows `PAIR ME` — run
-  `install.sh` (or call `/pair?token=…` directly) to set a token.
+- **First setup screen:** the device IP, generated four-digit pairing code,
+  and the exact `install.sh <device-ip>` command. After pairing, the main view
+  shows the IP in small text below the title strip.
 - **Cell grid** (middle): up to 4 source cells (1 = full, 2 = side-by-side,
   3 = 2-on-top + 1, 4 = 2×2). Each cell has a small label and a big status
   word, plus an `Action required` line when relevant.
@@ -527,18 +527,18 @@ A full-screen ambient view of today's events, pushed by the sidecar
 - `GET /reset-wifi?t=<token>` — wipe stored WiFi creds and reboot back into
   the `Claude-RLCD-Setup` captive portal. Use when moving the device to a
   new network.
-- `GET /pair?token=<4-32 alnum>` — set a new pairing token. Allowed without
-  auth when the device is unpaired; once paired, must include `&t=<current>`.
-- `GET /unpair?t=<token>` — clear the saved token, device returns to open
-  mode. Doesn't touch WiFi creds or source cells.
-- `GET /show-token` — flash the saved token on the LCD for ~5s. Unauth on
+- `GET /pair?token=<4-digit-code>` — claim an unpaired board using the code
+  displayed on its screen.
+- `GET /unpair?t=<code>` — unpair the device and generate a fresh code.
+  Doesn't touch WiFi credentials or source cells.
+- `GET /show-token` — flash the saved pairing code on the LCD for ~5s. Unauth on
   purpose; needs physical line-of-sight to read.
 - `GET /quote-tour` — cycle through every quote in the pool, 5s each
   (~100s total). For visual QA after editing the pool. Unauth; auto-clears.
 
 All write endpoints (`/notify`, `/forget`, `/todo`, `/reset-wifi`, `/unpair`)
-require `?t=<token>` once the device is paired. `/`, `/show-token`,
-`/quote-tour`, and `/pair` (in open mode) stay public.
+require `?t=<code>` once the device is paired. `/`, `/show-token`,
+`/quote-tour`, and `/pair` while unpaired stay public.
 
 ## Daily quote pool
 
@@ -714,36 +714,23 @@ is visible from across the room.
 
 ## Access control / pairing
 
-The device gates write endpoints behind a shared token (4-32 alphanumeric
-characters, e.g. `20030102` or `kitchen42`). Anyone on the LAN can read `/`,
-but only callers that send `?t=<token>` can change the screen.
+The board generates a random four-digit pairing code on first boot and stores
+it in NVS. Anyone on the LAN can read `/`, but only callers that send the code
+as `?t=<code>` can change the screen.
 
-**Pre-pair before gifting** (recommended):
-```bash
-curl "http://claude-rlcd.local/pair?token=20030102"
-```
-Write the token on a sticker, hand it over with the device. `install.sh`
-prompts the recipient for it on first run.
+During first setup, the screen shows both the device IP and pairing code.
+`install.sh <device-ip>` asks the user to enter that code, claims the board,
+and saves it locally. The code survives restarts and firmware updates.
 
-**Recipient pairs themselves:** if the device boots in open mode (screen shows
-`PAIR ME`), `install.sh` asks them to choose a token and calls `/pair`
-automatically.
-
-**Change the token** (must include the current one):
-```bash
-curl "http://claude-rlcd.local/pair?token=NEWTOKEN&t=20030102"
-```
-
-**Forgot the token:** any LAN host can call `curl http://claude-rlcd.local/show-token`
-to flash it on the LCD for 5s. To wipe and re-pair without the old token,
-re-flash the firmware (Preferences NVS gets cleared on a chip erase).
+**Show the code again:** double-tap KEY, or call
+`curl http://claude-rlcd.local/show-token`. The code appears for five seconds.
 
 **Unpair entirely** (e.g. before gifting the device to someone else, so they
 can pair it fresh):
 ```bash
-curl "http://claude-rlcd.local/unpair?t=<current-token>"
+curl "http://claude-rlcd.local/unpair?t=<current-code>"
 ```
-The screen will switch back to `PAIR ME` and any LAN host can `/pair` it.
+The board generates a new code and returns to its setup instructions.
 
 **Detach a single machine** (without touching the device, leaving other
 paired machines working):
@@ -816,7 +803,7 @@ future firmware updates can be installed without a cable:
 
 The update endpoint is deliberately unavailable while the device is in open
 (unpaired) mode. A rejected or interrupted upload leaves the running slot
-untouched. WiFi credentials and the pairing token live in NVS at `0x9000`,
+untouched. WiFi credentials and the pairing code live in NVS at `0x9000`,
 outside both application slots, so normal OTA updates preserve them.
 
 The current endpoint is the recovery-safe OTA foundation, not unattended
@@ -868,13 +855,9 @@ cd /mnt/d/dev/claude-to-RLCD
 **What a re-flash does and does not erase.** The NVS partition sits at the
 same `0x9000` offset in both the Arduino and factory layouts, so **stored WiFi
 credentials survive** a re-flash and the board will rejoin its old network.
-The pairing token does **not** survive, because it lives in the firmware's own
-Preferences namespace; the board comes back up in open mode showing `PAIR ME`,
-and you re-pair with:
-
-```bash
-curl "http://claude-rlcd.local/pair?token=$(cat ~/.claude/esp32-token)"
-```
+The pairing code survives an ordinary application re-flash because it lives in
+the firmware's Preferences namespace. A full chip erase removes it; the board
+generates a fresh code on its next boot.
 
 **Backing up first.** If the board is carrying firmware you might want back
 (for example the Waveshare `03_Fac` factory demo it ships with), dump the
@@ -950,14 +933,13 @@ echo 192.168.1.42      > ~/.claude/esp32-ip      # the board's IP, from its scre
                                                  # every prompt and mDNS costs
                                                  # ~1.4s a call. The script falls
                                                  # back to the name if this dies.
-echo 20030102          > ~/.claude/esp32-token   # pairing token from the sticker
+echo 4827              > ~/.claude/esp32-token   # four-digit code from the board
 chmod 600                ~/.claude/esp32-token
 # then hand-merge settings-snippet.json's "hooks" block into ~/.claude/settings.json
 ```
 
-Skip the `esp32-token` line only if the device is still in open mode
-(`paired = no` in the `/` dump). Once paired, every `/notify` without the
-token returns 403 and nothing reaches the screen.
+The value must match the code displayed by that board. Every `/notify` without
+the correct code returns 403 and nothing reaches the screen.
 
 Dependencies: `node` (for `npx`), `python3`, `curl`. `notify-esp32.sh` invokes
 `npx ccusage` to fetch the current 5-hour window and weekly spend.
@@ -1039,13 +1021,14 @@ reads the same `~/.claude/esp32-ip` and `~/.claude/esp32-token` files.
   caller didn't send the token. Check `cat ~/.claude/esp32-token`; if missing
   or wrong, re-run `install.sh` and re-enter it. To read the token off the
   LCD: `curl http://<host>/show-token`.
-- **Forgot the pairing token entirely** — `curl http://<host>/show-token`
+- **Forgot the pairing code entirely** — `curl http://<host>/show-token`
   flashes it on the LCD for 5s (unauthenticated; you need physical
   line-of-sight), or tap the KEY button, which does the same with no network
   at all. If you cannot see the screen either, hold KEY for 15s to factory
-  reset (clears the token and the WiFi credentials, then reboots).
+  reset (clears the code and the WiFi credentials, then reboots and generates
+  a new code).
 
-  Note that **re-flashing the firmware does not clear the token**. NVS lives
+  Note that **re-flashing the firmware does not clear the code**. NVS lives
   at `0x9000` outside the application image and survives an upload, which is
   also why the board rejoins its old WiFi after a re-flash. To wipe it from a
   host, erase the chip explicitly:

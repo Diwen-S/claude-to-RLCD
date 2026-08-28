@@ -11,7 +11,7 @@
 # wheel paths trip Explorer's 260-char MAX_PATH limit (error 0x80070780).
 # Plain `rm -rf` from WSL/Linux/macOS doesn't have the same problem.
 #
-# To wipe the device's pairing token entirely, hit GET /unpair on the device.
+# To unpair the device and generate a fresh code, hit GET /unpair.
 set -e
 
 CLAUDE_DIR="$HOME/.claude"
@@ -219,6 +219,6 @@ elif [ -d "$CAL_CONF_DIR" ] || [ -d "$SCRIPT_DIR/tools/.venv" ]; then
   echo "  calendar conf + venv kept (run ./uninstall.sh --purge-calendar to remove)"
 fi
 echo
-echo "The ESP itself was NOT touched. To wipe its pairing token too:"
-echo "  curl \"http://claude-rlcd.local/unpair?t=<current-token>\""
+echo "The ESP itself was NOT touched. To unpair it and generate a new code:"
+echo "  curl \"http://claude-rlcd.local/unpair?t=<current-code>\""
 echo "(or hit /reset-wifi to also reopen the captive portal)"

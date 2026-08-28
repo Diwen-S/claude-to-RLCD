@@ -114,11 +114,9 @@ else
   echo "        $HOST on every call, which is slower and can drop updates."
 fi
 
-# --- pairing token ------------------------------------------------------------
-# The ESP rejects /notify without ?t=<token> once it has been paired. The
-# device is either:
-#   - already paired by the gifter — recipient types the token on the sticker
-#   - in open mode — anyone on LAN may pair it now by choosing a token
+# --- pairing code -------------------------------------------------------------
+# Every board generates and displays its own four-digit code. On first setup,
+# the installer submits that code to claim the board and saves it locally.
 device_state=$(curl -s -m "$DEV_TIMEOUT" "http://$HOST/" | awk '/^paired/ {print $3, $4, $5}')
 existing_token=""
 if [ -f "$CLAUDE_DIR/esp32-token" ]; then
@@ -127,24 +125,19 @@ fi
 
 if printf '%s' "$device_state" | grep -q "^no"; then
   echo
-  echo "Device is in OPEN mode (no token saved). Set one now."
-  printf "Choose a token (4-32 alphanumeric chars), or press Enter to skip: "
+  printf "Enter the 4-digit pairing code shown on the board: "
   read -r new_token
   new_token=$(printf '%s' "$new_token" | tr -d ' \n\r')
-  if [ -n "$new_token" ]; then
-    if ! printf '%s' "$new_token" | grep -Eq '^[A-Za-z0-9]{4,32}$'; then
-      echo "Token shape invalid (need 4-32 alphanumeric). Aborting."
-      exit 1
-    fi
-    pair_resp=$(curl -sf -m "$DEV_TIMEOUT" "http://$HOST/pair?token=$new_token") || {
-      echo "Pairing call failed."; exit 1; }
-    echo "  $pair_resp"
-    printf '%s\n' "$new_token" > "$CLAUDE_DIR/esp32-token"
-    chmod 600 "$CLAUDE_DIR/esp32-token"
-    echo "Wrote $CLAUDE_DIR/esp32-token"
-  else
-    echo "Skipped — device stays in open mode (any LAN host can push)."
+  if ! printf '%s' "$new_token" | grep -Eq '^[0-9]{4}$'; then
+    echo "The pairing code must be exactly four digits. Aborting."
+    exit 1
   fi
+  pair_resp=$(curl -sf -m "$DEV_TIMEOUT" "http://$HOST/pair?token=$new_token") || {
+    echo "Pairing failed. Check the code displayed on the board."; exit 1; }
+  echo "  $pair_resp"
+  printf '%s\n' "$new_token" > "$CLAUDE_DIR/esp32-token"
+  chmod 600 "$CLAUDE_DIR/esp32-token"
+  echo "Wrote $CLAUDE_DIR/esp32-token"
 else
   echo
   echo "Device is already paired."
@@ -153,12 +146,12 @@ else
     curl -sf -m "$DEV_TIMEOUT" "http://$HOST/forget?t=$existing_token&src=__probe" -o /dev/null || true
     echo "  Existing $CLAUDE_DIR/esp32-token already works — keeping it."
   else
-    printf "Enter pairing token from the device owner: "
+    printf "Enter the 4-digit pairing code shown on the board: "
     read -r entered_token
     entered_token=$(printf '%s' "$entered_token" | tr -d ' \n\r')
     [ -z "$entered_token" ] && { echo "No token given. Aborting."; exit 1; }
     if ! curl -sf -m "$DEV_TIMEOUT" "http://$HOST/notify?t=$entered_token&src=__probe&status=__probe" -o /dev/null; then
-      echo "Token rejected by device. Ask owner for the right one, or run"
+      echo "Pairing code rejected. Read it from the board, or run"
       echo "  curl http://$HOST/show-token   (flashes it on the LCD)"
       exit 1
     fi
@@ -720,10 +713,10 @@ Start a new Claude Code and/or Codex session — the screen switches to WORKING
 on your first prompt and DONE when the agent finishes. Codex will ask you to
 trust its hooks the first time.
 
-Optional (the t= query arg is your pairing token; required once paired):
+Optional (the t= query arg is your four-digit pairing code):
   echo "MyLabel" > ~/.claude/session-label                       # rename Claude session
   echo "MyLabel" > ~/.claude/session-label-codex                 # rename Codex session
   curl "http://$HOST/forget?t=\$(cat ~/.claude/esp32-token)&all=1"   # wipe sources
   curl "http://$HOST/reset-wifi?t=\$(cat ~/.claude/esp32-token)"     # re-portal
-  curl "http://$HOST/show-token"                                  # flash token on LCD
+  curl "http://$HOST/show-token"                                  # show code on LCD
 EOF
